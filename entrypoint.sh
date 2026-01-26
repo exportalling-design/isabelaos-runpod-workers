@@ -1,3 +1,3 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -e
-python3 -u /app/worker.py
+python3 /app/worker.py
