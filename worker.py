@@ -1,14 +1,11 @@
 import runpod
-
-print("[BOOT] SMOKE WORKER v1 - isabelaos-runpod-workers", flush=True)
+import torch
 
 def handler(job):
-    inp = job.get("input") or {}
     return {
         "ok": True,
-        "msg": "SMOKE_OK",
-        "input": inp,
-        "input_keys": list(inp.keys()),
+        "cuda": torch.cuda.is_available(),
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
     }
 
 runpod.serverless.start({"handler": handler})
