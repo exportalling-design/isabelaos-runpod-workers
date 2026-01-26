@@ -1,2 +1,8 @@
 runpod==1.7.13
-torch
+diffusers==0.32.2
+transformers==4.48.3
+accelerate==1.3.0
+safetensors==0.5.2
+huggingface_hub==0.27.1
+Pillow==10.4.0
+numpy==1.26.4
