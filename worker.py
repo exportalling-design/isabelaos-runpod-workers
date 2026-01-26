@@ -184,6 +184,104 @@ def _load_i2v():
     return _pipe_i2v
 
 
+# ---------------------------
+# FASE 3: Probe + Dry Load
+# ---------------------------
+def _safe_ls(path: str, limit: int = 120):
+    try:
+        return sorted(os.listdir(path))[:limit]
+    except Exception as e:
+        return [f"__LS_ERROR__: {str(e)}"]
+
+def _probe_path(p: str):
+    out = {
+        "path": p,
+        "exists": os.path.exists(p),
+        "is_dir": os.path.isdir(p),
+    }
+
+    if out["is_dir"]:
+        out["ls"] = _safe_ls(p)
+
+        # checks típicos diffusers
+        out["has_model_index"] = os.path.isfile(os.path.join(p, "model_index.json"))
+        for sf in ["vae", "scheduler", "text_encoder", "tokenizer", "transformer", "unet"]:
+            out[f"has_{sf}"] = os.path.isdir(os.path.join(p, sf))
+
+        # algunos repos usan "text_encoder_2", etc.
+        out["extra_subfolders"] = [
+            x for x in out["ls"]
+            if os.path.isdir(os.path.join(p, x))
+            and x not in ["vae", "scheduler", "text_encoder", "tokenizer", "transformer", "unet"]
+        ][:30]
+
+    return out
+
+def _probe_models():
+    ws_ok = os.path.isdir("/workspace")
+    return {
+        "cwd": os.getcwd(),
+        "workspace_exists": ws_ok,
+        "workspace_ls": _safe_ls("/workspace") if ws_ok else [],
+        "t2v": _probe_path(MODEL_T2V_LOCAL),
+        "i2v": _probe_path(MODEL_I2V_LOCAL),
+        "gpu_info": _gpu_info(),
+    }
+
+def _dry_load(which: str):
+    """
+    Carga en seco: valida estructura de carpeta y que diffusers pueda abrirla,
+    sin inferencia. Carga primero en CPU (más barato) y NO hace .to("cuda").
+    """
+    which = (which or "").strip().lower()
+    if which not in ("t2v", "i2v"):
+        which = "t2v"
+
+    if which == "t2v":
+        base = MODEL_T2V_LOCAL
+        _assert_model_dir(base, "T2V")
+
+        # VAE suele venir en subfolder
+        vae = AutoencoderKLWan.from_pretrained(
+            base,
+            subfolder="vae",
+            torch_dtype=torch.float32,
+            local_files_only=True,
+            low_cpu_mem_usage=True,
+        )
+
+        # pipeline en CPU solo para validar archivos
+        _ = WanPipeline.from_pretrained(
+            base,
+            vae=vae,
+            torch_dtype=torch.float16,
+            local_files_only=True,
+            low_cpu_mem_usage=True,
+        )
+        return {"which": "t2v", "loaded": True, "base": base}
+
+    else:
+        base = MODEL_I2V_LOCAL
+        _assert_model_dir(base, "I2V")
+
+        vae = AutoencoderKLWan.from_pretrained(
+            base,
+            subfolder="vae",
+            torch_dtype=torch.float32,
+            local_files_only=True,
+            low_cpu_mem_usage=True,
+        )
+
+        _ = WanImageToVideoPipeline.from_pretrained(
+            base,
+            vae=vae,
+            torch_dtype=torch.float16,
+            local_files_only=True,
+            low_cpu_mem_usage=True,
+        )
+        return {"which": "i2v", "loaded": True, "base": base}
+
+
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     inp = job.get("input") or {}
     ping = str(inp.get("ping") or "").strip().lower()
@@ -205,6 +303,67 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             "ok": True,
             **_gpu_info(),
         }
+
+    # -------------------------
+    # FASE 3 - Probe models
+    # -------------------------
+    if ping in ("probe_models", "models_probe"):
+        return {
+            "ok": True,
+            "phase": "F3_probe",
+            "probe": _probe_models(),
+        }
+
+    # -------------------------
+    # FASE 3 - Dry load (no inference)
+    # -------------------------
+    if ping in ("dry_load_t2v", "dryload_t2v"):
+        t0 = time.time()
+        try:
+            res = _dry_load("t2v")
+            return {
+                "ok": True,
+                "phase": "F3_dry_load",
+                "result": res,
+                "seconds": round(time.time() - t0, 3),
+                "paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
+                "gpu_info": _gpu_info(),
+                "note": "Dry load only (CPU). No inference.",
+            }
+        except Exception as e:
+            _cuda_cleanup()
+            return {
+                "ok": False,
+                "phase": "F3_dry_load",
+                "error": str(e),
+                "seconds": round(time.time() - t0, 3),
+                "paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
+                "gpu_info": _gpu_info(),
+            }
+
+    if ping in ("dry_load_i2v", "dryload_i2v"):
+        t0 = time.time()
+        try:
+            res = _dry_load("i2v")
+            return {
+                "ok": True,
+                "phase": "F3_dry_load",
+                "result": res,
+                "seconds": round(time.time() - t0, 3),
+                "paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
+                "gpu_info": _gpu_info(),
+                "note": "Dry load only (CPU). No inference.",
+            }
+        except Exception as e:
+            _cuda_cleanup()
+            return {
+                "ok": False,
+                "phase": "F3_dry_load",
+                "error": str(e),
+                "seconds": round(time.time() - t0, 3),
+                "paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
+                "gpu_info": _gpu_info(),
+            }
 
     # -------------------------
     # WAN load test (NO inference)
