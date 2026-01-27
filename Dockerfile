@@ -14,12 +14,18 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     ffmpeg \
+    libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # -------------------------
-# Torch CUDA 12.1 (ANTES de requirements)
+# Pip actualizado
+# -------------------------
+RUN pip3 install --upgrade pip
+
+# -------------------------
+# 🔥 TORCH EXACTO (IGUAL al venv que funciona)
 # -------------------------
 RUN pip3 install --no-cache-dir \
     torch==2.3.1+cu121 \
@@ -28,7 +34,7 @@ RUN pip3 install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/cu121
 
 # -------------------------
-# Python deps
+# Requirements WAN 2.2
 # -------------------------
 COPY requirements.txt /app/requirements.txt
 RUN pip3 install --no-cache-dir -r /app/requirements.txt
