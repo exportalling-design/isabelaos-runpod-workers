@@ -2,6 +2,7 @@ import os
 import time
 import gc
 import base64
+import binascii
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -79,7 +80,6 @@ DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 _pipe_t2v = None
 _pipe_i2v = None
 
-
 # ---------------------------
 # Utils
 # ---------------------------
@@ -95,7 +95,6 @@ def _cuda_cleanup():
             pass
 
 def _hard_cleanup():
-    # best-effort cleanup between heavy jobs
     try:
         gc.collect()
     except Exception:
@@ -130,7 +129,6 @@ def _assert_model_dir(path: str, label: str):
         raise RuntimeError(f"{label} model path not found: {path}. (En serverless puede ser /runpod-volume/...)")
 
 def _pipe_memory_tweaks(pipe):
-    # These help in inference; harmless on load
     try:
         pipe.enable_attention_slicing("max")
     except Exception:
@@ -194,46 +192,91 @@ def _lazy_import_wan():
     except Exception as e:
         return None, None, None, str(e)
 
-def _ensure_dir(p: str):
-    os.makedirs(p, exist_ok=True)
+# ---------- Robust base64 image decode ----------
+def _decode_b64(s: str) -> bytes:
+    if not s:
+        raise ValueError("image_b64 vacío")
+
+    s = str(s).strip()
+
+    # DataURL
+    if s.lower().startswith("data:") and "," in s:
+        s = s.split(",", 1)[1].strip()
+
+    # urlsafe base64
+    s = s.replace("-", "+").replace("_", "/")
+
+    # padding
+    pad = (-len(s)) % 4
+    if pad:
+        s += "=" * pad
+
+    try:
+        return base64.b64decode(s, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ValueError(f"image_b64 inválido: {e}")
 
 def _b64_to_pil_image(image_b64: str):
     from PIL import Image
-    s = image_b64.strip()
-    # accept data URL too
-    if s.startswith("data:image"):
-        s = s.split(",", 1)[-1]
-    raw = base64.b64decode(s)
-    return Image.open(BytesIO(raw)).convert("RGB")
+    raw = _decode_b64(image_b64)
+    img = Image.open(BytesIO(raw))
+    img.load()
+    return img.convert("RGB")
 
-def _save_video_mp4(frames, out_path: str, fps: int = 24):
+def _frames_to_mp4_bytes(frames, fps: int = 24) -> bytes:
     """
-    frames: list of PIL.Image or numpy arrays
+    Convierte frames (PIL o np) a mp4 bytes en memoria (sin volumen).
+    Requiere imageio + ffmpeg en container (normalmente runpod lo trae; si no, se ajusta Dockerfile).
     """
     import numpy as np
     import imageio.v2 as imageio
+    import tempfile
 
-    _ensure_dir(os.path.dirname(out_path))
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=True) as tmp:
+        writer = imageio.get_writer(tmp.name, fps=fps, codec="libx264", quality=8)
+        try:
+            for f in frames:
+                if hasattr(f, "convert"):  # PIL
+                    arr = np.array(f.convert("RGB"))
+                else:
+                    arr = f
+                writer.append_data(arr)
+        finally:
+            writer.close()
 
-    writer = imageio.get_writer(out_path, fps=fps, codec="libx264", quality=8)
+        tmp.seek(0)
+        return tmp.read()
+
+def _extract_frames(result):
+    if isinstance(result, dict):
+        for k in ("frames", "videos", "video"):
+            if k in result:
+                v = result[k]
+                if isinstance(v, list) and len(v) == 1 and isinstance(v[0], list):
+                    return v[0]
+                return v
+
+    for k in ("frames", "videos", "video"):
+        if hasattr(result, k):
+            v = getattr(result, k)
+            if isinstance(v, list) and len(v) == 1 and isinstance(v[0], list):
+                return v[0]
+            return v
+
     try:
-        for f in frames:
-            if hasattr(f, "convert"):  # PIL
-                arr = np.array(f.convert("RGB"))
-            else:
-                arr = f
-            writer.append_data(arr)
-    finally:
-        writer.close()
+        v = result[0]
+        if isinstance(v, list) and len(v) == 1 and isinstance(v[0], list):
+            return v[0]
+        return v
+    except Exception:
+        pass
 
+    raise RuntimeError(f"Could not extract frames from result type={type(result)}")
 
 # ---------------------------
 # Pipelines
 # ---------------------------
 def _unload_pipes(keep: Optional[str] = None):
-    """
-    keep: "t2v" | "i2v" | None
-    """
     global _pipe_t2v, _pipe_i2v
     if keep != "t2v" and _pipe_t2v is not None:
         try:
@@ -335,14 +378,10 @@ def _load_i2v(unload_other: bool = True):
     print(f"[WAN_LOAD] I2V loaded in {time.time() - t0:.2f}s")
     return _pipe_i2v
 
-
 # ---------------------------
-# NEW: Find / list volume paths
+# Find / list volume paths
 # ---------------------------
 def _walk_find_model_index(root: str, max_depth: int = 4, limit: int = 50) -> List[str]:
-    """
-    Busca carpetas que contengan model_index.json dentro de root, con profundidad limitada.
-    """
     hits = []
     root = root.rstrip("/")
     if not os.path.isdir(root):
@@ -368,44 +407,6 @@ def _walk_find_model_index(root: str, max_depth: int = 4, limit: int = 50) -> Li
                 queue.append((p, depth + 1))
     return hits
 
-
-# ---------------------------
-# Inference helpers (robust extraction)
-# ---------------------------
-def _extract_frames(result):
-    """
-    Intenta sacar frames de varios formatos posibles.
-    """
-    # dict-like
-    if isinstance(result, dict):
-        for k in ("frames", "videos", "video"):
-            if k in result:
-                v = result[k]
-                # result["frames"] puede ser [[...]]
-                if isinstance(v, list) and len(v) == 1 and isinstance(v[0], list):
-                    return v[0]
-                return v
-
-    # object with attrs
-    for k in ("frames", "videos", "video"):
-        if hasattr(result, k):
-            v = getattr(result, k)
-            if isinstance(v, list) and len(v) == 1 and isinstance(v[0], list):
-                return v[0]
-            return v
-
-    # index fallback
-    try:
-        v = result[0]
-        if isinstance(v, list) and len(v) == 1 and isinstance(v[0], list):
-            return v[0]
-        return v
-    except Exception:
-        pass
-
-    raise RuntimeError(f"Could not extract frames from result type={type(result)}")
-
-
 # ---------------------------
 # Handler
 # ---------------------------
@@ -413,9 +414,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     inp = job.get("input") or {}
     ping = str(inp.get("ping") or "").strip().lower()
 
-    # -------------------------
-    # Debug echo
-    # -------------------------
+    # ---- debug ----
     if ping in ("echo", "debug"):
         return {
             "ok": True,
@@ -434,37 +433,22 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             }
         }
 
-    # -------------------------
-    # Basic smoke
-    # -------------------------
     if ping == "smoke":
-        return {
-            "ok": True,
-            "msg": "SMOKE_OK",
-            "input_keys": list(inp.keys()),
-            "gpu_info": _gpu_info(),
-            **_diffusers_info(),
-        }
+        return {"ok": True, "msg": "SMOKE_OK", "gpu_info": _gpu_info(), **_diffusers_info()}
 
     if ping == "gpu_sanity":
         return {"ok": True, **_gpu_info(), **_diffusers_info()}
 
-    # -------------------------
-    # List common mount points
-    # -------------------------
+    # ---- list paths ----
     if ping == "list_paths":
         candidates = [
             "/",
             "/workspace",
             "/workspace/models",
             "/workspace/models/wan22",
-            "/workspace/models/wan2.2",
-            "/workspace/models/wan",
             "/runpod-volume",
             "/runpod-volume/models",
             "/runpod-volume/models/wan22",
-            "/runpod-volume/models/wan2.2",
-            "/runpod-volume/models/wan",
         ]
         out = {"ok": True, "msg": "LIST_PATHS_OK", "paths": {}}
         for p in candidates:
@@ -478,23 +462,14 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         out["resolved_paths"] = {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL}
         return out
 
-    # -------------------------
-    # Find Wan models by scanning for model_index.json
-    # -------------------------
     if ping == "find_wan_models":
-        roots = inp.get("roots") or [
-            "/workspace/models",
-            "/runpod-volume/models",
-            "/workspace",
-            "/runpod-volume",
-        ]
-        max_depth = int(inp.get("max_depth") or 5)
-        limit = int(inp.get("limit") or 50)
+        roots = inp.get("roots") or ["/runpod-volume/models", "/runpod-volume", "/workspace/models", "/workspace"]
+        max_depth = int(inp.get("max_depth") or 6)
+        limit = int(inp.get("limit") or 80)
 
         found = {}
         for r in roots:
-            r = str(r)
-            found[r] = _walk_find_model_index(r, max_depth=max_depth, limit=limit)
+            found[str(r)] = _walk_find_model_index(str(r), max_depth=max_depth, limit=limit)
 
         return {
             "ok": True,
@@ -505,12 +480,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             "found_model_dirs": found,
             "gpu_info": _gpu_info(),
             **_diffusers_info(),
-            "note": "Busca carpetas que tengan model_index.json. Usa esto para confirmar la ruta real en serverless.",
         }
 
-    # -------------------------
-    # Probe modelos (SIN diffusers)
-    # -------------------------
     if ping in ("probe_models", "probe_model", "models_probe"):
         return {
             "ok": True,
@@ -520,64 +491,65 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             "i2v": _probe_model_tree(MODEL_I2V_LOCAL),
             "gpu_info": _gpu_info(),
             **_diffusers_info(),
-            "note": "Esto no carga pipelines. Solo verifica estructura en el filesystem del worker.",
         }
 
-    # -------------------------
-    # WAN load test (NO inference)
-    # -------------------------
+    # ---- load only ----
     if ping == "wan_load":
-        which = str(inp.get("which") or "t2v").strip().lower()
-        if which not in ("t2v", "i2v", "both"):
-            which = "t2v"
-
-        # Tip: en 48GB (RTX 6000 Ada) "both" casi seguro OOM.
-        unload_other = bool(inp.get("unload_other", True))
-
-        out = {
-            "ok": True,
-            "ping": "wan_load",
-            "which": which,
-            "paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
-            "gpu_info": _gpu_info(),
-            **_diffusers_info(),
-            "loaded": [],
-            "timing": {},
-            "note": "Loaded pipelines only. No inference performed.",
-        }
+        which = str(inp.get("which") or "i2v").strip().lower()
+        if which not in ("t2v", "i2v"):
+            which = "i2v"
 
         try:
             t0 = time.time()
-            if which in ("t2v", "both"):
-                _load_t2v(unload_other=unload_other and which != "both")
-                out["loaded"].append("t2v")
-            out["timing"]["t2v_s"] = round(time.time() - t0, 3) if which in ("t2v", "both") else None
+            if which == "i2v":
+                _load_i2v(unload_other=True)
+            else:
+                _load_t2v(unload_other=True)
 
-            t1 = time.time()
-            if which in ("i2v", "both"):
-                _load_i2v(unload_other=unload_other and which != "both")
-                out["loaded"].append("i2v")
-            out["timing"]["i2v_s"] = round(time.time() - t1, 3) if which in ("i2v", "both") else None
-
-            return out
-
-        except Exception as e:
-            _hard_cleanup()
             return {
-                "ok": False,
+                "ok": True,
                 "ping": "wan_load",
-                "error": str(e),
+                "which": which,
                 "paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
                 "gpu_info": _gpu_info(),
                 **_diffusers_info(),
+                "seconds": round(time.time() - t0, 3),
+                "note": "Loaded pipeline only. No inference performed.",
             }
+        except Exception as e:
+            _hard_cleanup()
+            return {"ok": False, "ping": "wan_load", "error": str(e), "gpu_info": _gpu_info(), **_diffusers_info()}
 
-    # -------------------------
-    # NEW: I2V generate (primer video real desde imagen)
-    # -------------------------
+    # ---- image debug ----
+    if ping == "image_debug":
+        try:
+            from PIL import Image
+            s = str(inp.get("image_b64") or "")
+            raw = _decode_b64(s)
+            head_hex = raw[:32].hex()
+            img = Image.open(BytesIO(raw))
+            img.load()
+            return {
+                "ok": True,
+                "msg": "IMAGE_DEBUG_OK",
+                "bytes_len": len(raw),
+                "head_hex": head_hex,
+                "pil_format": img.format,
+                "mode": img.mode,
+                "size": [img.size[0], img.size[1]],
+            }
+        except Exception as e:
+            preview = None
+            try:
+                preview = (str(inp.get("image_b64") or ""))[:140]
+            except Exception:
+                pass
+            return {"ok": False, "msg": "IMAGE_DEBUG_FAIL", "error": str(e), "image_b64_preview": preview}
+
+    # ---- I2V generate ----
     if ping in ("i2v_generate", "wan_i2v_generate"):
-        image_b64 = inp.get("image_b64") or inp.get("image")  # soporte por si mandas "image"
-        prompt = str(inp.get("prompt") or "cinematic, high quality").strip()
+        image_b64 = inp.get("image_b64") or inp.get("image")
+        prompt = str(inp.get("prompt") or "cinematic, ultra realistic, high quality").strip()
         negative = str(inp.get("negative") or "").strip()
 
         # Defaults seguros para primer éxito
@@ -594,7 +566,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
         try:
             pipe = _load_i2v(unload_other=True)
-
             init_image = _b64_to_pil_image(str(image_b64))
 
             generator = None
@@ -603,8 +574,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 generator = torch.Generator(device="cuda").manual_seed(seed) if DEVICE == "cuda" else torch.Generator().manual_seed(seed)
 
             t0 = time.time()
-
-            # Nota: si el signature real difiere, este error te dirá qué args acepta.
             result = pipe(
                 prompt=prompt,
                 negative_prompt=negative if negative else None,
@@ -619,15 +588,13 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
             frames = _extract_frames(result)
 
-            out_dir = "/runpod-volume/outputs/i2v"
-            out_name = f"i2v_{int(time.time())}.mp4"
-            out_path = os.path.join(out_dir, out_name)
-            _save_video_mp4(frames, out_path, fps=fps)
+            mp4_bytes = _frames_to_mp4_bytes(frames, fps=fps)
+            video_b64 = base64.b64encode(mp4_bytes).decode("utf-8")
 
             return {
                 "ok": True,
                 "ping": ping,
-                "out_path": out_path,
+                "video_b64": video_b64,
                 "seconds": round(time.time() - t0, 3),
                 "gpu_info": _gpu_info(),
                 **_diffusers_info(),
@@ -640,6 +607,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     "width": width,
                     "seed": seed,
                 },
+                "note": "video_b64 es mp4 en base64. Súbelo a Supabase desde tu API (como Flux).",
             }
 
         except torch.cuda.OutOfMemoryError as e:
@@ -649,7 +617,72 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             _hard_cleanup()
             return {"ok": False, "ping": ping, "error": str(e), "gpu_info": _gpu_info(), **_diffusers_info()}
 
-    # Default: echo (tu "default eco" es esto)
+    # ---- T2V generate (prompt -> video) ----
+    if ping in ("t2v_generate", "wan_t2v_generate"):
+        prompt = str(inp.get("prompt") or "").strip()
+        negative = str(inp.get("negative") or "").strip()
+        if not prompt:
+            return {"ok": False, "ping": ping, "error": "missing prompt", "gpu_info": _gpu_info(), **_diffusers_info()}
+
+        num_frames = int(inp.get("frames") or inp.get("num_frames") or 16)
+        fps = int(inp.get("fps") or 24)
+        steps = int(inp.get("steps") or inp.get("num_inference_steps") or 14)
+        guidance = float(inp.get("guidance") or inp.get("guidance_scale") or 4.0)
+        height = int(inp.get("height") or 512)
+        width = int(inp.get("width") or 512)
+        seed = inp.get("seed", None)
+
+        try:
+            pipe = _load_t2v(unload_other=True)
+
+            generator = None
+            if seed is not None and str(seed) != "":
+                seed = int(seed)
+                generator = torch.Generator(device="cuda").manual_seed(seed) if DEVICE == "cuda" else torch.Generator().manual_seed(seed)
+
+            t0 = time.time()
+            result = pipe(
+                prompt=prompt,
+                negative_prompt=negative if negative else None,
+                num_inference_steps=steps,
+                guidance_scale=guidance,
+                num_frames=num_frames,
+                height=height,
+                width=width,
+                generator=generator,
+            )
+
+            frames = _extract_frames(result)
+            mp4_bytes = _frames_to_mp4_bytes(frames, fps=fps)
+            video_b64 = base64.b64encode(mp4_bytes).decode("utf-8")
+
+            return {
+                "ok": True,
+                "ping": ping,
+                "video_b64": video_b64,
+                "seconds": round(time.time() - t0, 3),
+                "gpu_info": _gpu_info(),
+                **_diffusers_info(),
+                "params": {
+                    "frames": num_frames,
+                    "fps": fps,
+                    "steps": steps,
+                    "guidance": guidance,
+                    "height": height,
+                    "width": width,
+                    "seed": seed,
+                },
+                "note": "video_b64 es mp4 en base64. Súbelo a Supabase desde tu API (como Flux).",
+            }
+
+        except torch.cuda.OutOfMemoryError as e:
+            _hard_cleanup()
+            return {"ok": False, "ping": ping, "error": f"CUDA OOM: {str(e)}", "gpu_info": _gpu_info(), **_diffusers_info()}
+        except Exception as e:
+            _hard_cleanup()
+            return {"ok": False, "ping": ping, "error": str(e), "gpu_info": _gpu_info(), **_diffusers_info()}
+
+    # Default
     return {
         "ok": True,
         "msg": "DEFAULT_ECHO",
@@ -658,6 +691,5 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         "gpu_info": _gpu_info(),
         **_diffusers_info(),
     }
-
 
 runpod.serverless.start({"handler": handler})
