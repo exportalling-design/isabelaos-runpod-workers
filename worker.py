@@ -1,6 +1,6 @@
 import os
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Tuple
 
 # --- ENV hardening ---
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
@@ -10,10 +10,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import huggingface_hub as h
 if not hasattr(h, "cached_download"):
     from huggingface_hub import hf_hub_download as _hf_hub_download
-
     def _cached_download(*args, **kwargs):
         return _hf_hub_download(*args, **kwargs)
-
     h.cached_download = _cached_download
 
 import torch
@@ -44,11 +42,9 @@ if not hasattr(nn, "RMSNorm"):
 # --- Some torch builds don't like enable_gqa kwarg ---
 if hasattr(F, "scaled_dot_product_attention"):
     _orig_sdp = F.scaled_dot_product_attention
-
     def patched_sdp_attention(*args, **kwargs):
         kwargs.pop("enable_gqa", None)
         return _orig_sdp(*args, **kwargs)
-
     F.scaled_dot_product_attention = patched_sdp_attention
 
 import runpod
@@ -68,7 +64,6 @@ def _normalize_model_path(p: str) -> str:
         p = p.replace("//", "/")
     return p
 
-
 DEFAULT_T2V_PATH = "/workspace/models/wan22/ti2v-5b"
 DEFAULT_I2V_PATH = "/workspace/models/wan22/i2v-a14b"
 
@@ -81,7 +76,6 @@ DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 _pipe_t2v = None
 _pipe_i2v = None
 
-
 def _cuda_cleanup():
     if torch.cuda.is_available():
         try:
@@ -92,7 +86,6 @@ def _cuda_cleanup():
             torch.cuda.ipc_collect()
         except Exception:
             pass
-
 
 def _gpu_info():
     info = {
@@ -110,7 +103,6 @@ def _gpu_info():
             pass
     return info
 
-
 def _diffusers_info():
     try:
         import diffusers
@@ -118,11 +110,9 @@ def _diffusers_info():
     except Exception as e:
         return {"diffusers_version": None, "diffusers_import_error": str(e)}
 
-
 def _assert_model_dir(path: str, label: str):
     if not os.path.isdir(path):
-        raise RuntimeError(f"{label} model path not found: {path} (check volume mount)")
-
+        raise RuntimeError(f"{label} model path not found: {path}. (En serverless puede ser /runpod-volume/...)")
 
 def _pipe_memory_tweaks(pipe):
     try:
@@ -139,7 +129,6 @@ def _pipe_memory_tweaks(pipe):
         pass
     return pipe
 
-
 def _list_dir_safe(path: str, limit: int = 200):
     try:
         items = sorted(os.listdir(path))
@@ -149,12 +138,7 @@ def _list_dir_safe(path: str, limit: int = 200):
     except Exception as e:
         return [f"<cannot list: {e}>"]
 
-
 def _probe_model_tree(base_path: str):
-    """
-    Verifica estructura del modelo SIN importar diffusers.
-    Útil para confirmar que el volumen trae lo necesario.
-    """
     out = {
         "path": base_path,
         "exists": os.path.isdir(base_path),
@@ -167,22 +151,19 @@ def _probe_model_tree(base_path: str):
 
     out["top"] = _list_dir_safe(base_path, limit=200)
 
-    # Archivos comunes de diffusers
     must_files = ["model_index.json"]
-    optional_files = ["config.json", "scheduler", "tokenizer", "text_encoder", "transformer", "unet", "vae"]
+    optional = ["config.json", "scheduler", "tokenizer", "text_encoder", "transformer", "unet", "vae"]
 
     for f in must_files:
         out["checks"][f] = os.path.exists(os.path.join(base_path, f))
 
-    # Subfolders típicos
-    for name in optional_files:
+    for name in optional:
         p = os.path.join(base_path, name)
         out["subfolders"][name] = {
             "exists": os.path.exists(p),
             "is_dir": os.path.isdir(p),
         }
 
-    # Si hay vae/unet/transformer, listamos 1 nivel
     for sf in ["vae", "unet", "transformer", "scheduler", "text_encoder", "tokenizer"]:
         p = os.path.join(base_path, sf)
         if os.path.isdir(p):
@@ -190,18 +171,12 @@ def _probe_model_tree(base_path: str):
 
     return out
 
-
 def _lazy_import_wan():
-    """
-    Importa Wan* SOLO cuando lo pedimos.
-    Esto evita que el worker se caiga al iniciar si diffusers no trae WanPipeline.
-    """
     try:
         from diffusers import WanPipeline, AutoencoderKLWan, WanImageToVideoPipeline
         return WanPipeline, AutoencoderKLWan, WanImageToVideoPipeline, None
     except Exception as e:
         return None, None, None, str(e)
-
 
 def _load_t2v():
     global _pipe_t2v
@@ -243,7 +218,6 @@ def _load_t2v():
     print(f"[WAN_LOAD] T2V loaded in {time.time() - t0:.2f}s")
     return _pipe_t2v
 
-
 def _load_i2v():
     global _pipe_i2v
     if _pipe_i2v is not None:
@@ -284,10 +258,68 @@ def _load_i2v():
     print(f"[WAN_LOAD] I2V loaded in {time.time() - t0:.2f}s")
     return _pipe_i2v
 
+# ---------------------------
+# NEW: Find / list volume paths
+# ---------------------------
+def _exists_dir(p: str) -> bool:
+    return os.path.isdir(p)
+
+def _walk_find_model_index(root: str, max_depth: int = 4, limit: int = 50) -> List[str]:
+    """
+    Busca carpetas que contengan model_index.json dentro de root, con profundidad limitada.
+    """
+    hits = []
+    root = root.rstrip("/")
+    if not os.path.isdir(root):
+        return hits
+
+    # BFS por niveles para limitar depth sin costo brutal
+    queue: List[Tuple[str, int]] = [(root, 0)]
+    while queue and len(hits) < limit:
+        cur, depth = queue.pop(0)
+        if depth > max_depth:
+            continue
+        try:
+            items = os.listdir(cur)
+        except Exception:
+            continue
+
+        if "model_index.json" in items:
+            hits.append(cur)
+            # no retornamos inmediato, puede haber más
+            continue
+
+        # expand
+        for name in items:
+            p = os.path.join(cur, name)
+            if os.path.isdir(p):
+                queue.append((p, depth + 1))
+    return hits
 
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     inp = job.get("input") or {}
     ping = str(inp.get("ping") or "").strip().lower()
+
+    # -------------------------
+    # Debug echo (para ver si llega input bien)
+    # -------------------------
+    if ping in ("echo", "debug"):
+        return {
+            "ok": True,
+            "msg": "ECHO_OK",
+            "job_keys": list(job.keys()),
+            "input": inp,
+            "gpu_info": _gpu_info(),
+            **_diffusers_info(),
+            "env": {
+                "WAN_T2V_PATH": os.environ.get("WAN_T2V_PATH"),
+                "WAN_I2V_PATH": os.environ.get("WAN_I2V_PATH"),
+            },
+            "resolved_paths": {
+                "t2v": MODEL_T2V_LOCAL,
+                "i2v": MODEL_I2V_LOCAL,
+            }
+        }
 
     # -------------------------
     # Basic smoke
@@ -296,35 +328,86 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "ok": True,
             "msg": "SMOKE_OK",
-            "input": inp,
             "input_keys": list(inp.keys()),
             "gpu_info": _gpu_info(),
             **_diffusers_info(),
         }
 
     if ping == "gpu_sanity":
+        return {"ok": True, **_gpu_info(), **_diffusers_info()}
+
+    # -------------------------
+    # List common mount points
+    # -------------------------
+    if ping == "list_paths":
+        candidates = [
+            "/",
+            "/workspace",
+            "/workspace/models",
+            "/workspace/models/wan22",
+            "/workspace/models/wan2.2",
+            "/workspace/models/wan",
+            "/runpod-volume",
+            "/runpod-volume/models",
+            "/runpod-volume/models/wan22",
+            "/runpod-volume/models/wan2.2",
+            "/runpod-volume/models/wan",
+        ]
+        out = {"ok": True, "msg": "LIST_PATHS_OK", "paths": {}}
+        for p in candidates:
+            out["paths"][p] = {
+                "exists": os.path.exists(p),
+                "is_dir": os.path.isdir(p),
+                "items": _list_dir_safe(p, limit=200) if os.path.isdir(p) else []
+            }
+        out["gpu_info"] = _gpu_info()
+        out.update(_diffusers_info())
+        out["resolved_paths"] = {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL}
+        return out
+
+    # -------------------------
+    # Find Wan models by scanning for model_index.json
+    # -------------------------
+    if ping == "find_wan_models":
+        roots = inp.get("roots") or [
+            "/workspace/models",
+            "/runpod-volume/models",
+            "/workspace",
+            "/runpod-volume",
+        ]
+        max_depth = int(inp.get("max_depth") or 5)
+        limit = int(inp.get("limit") or 50)
+
+        found = {}
+        for r in roots:
+            r = str(r)
+            found[r] = _walk_find_model_index(r, max_depth=max_depth, limit=limit)
+
         return {
             "ok": True,
-            **_gpu_info(),
+            "msg": "FIND_WAN_MODELS_OK",
+            "roots": roots,
+            "max_depth": max_depth,
+            "limit": limit,
+            "found_model_dirs": found,
+            "gpu_info": _gpu_info(),
             **_diffusers_info(),
+            "note": "Busca carpetas que tengan model_index.json. Usa esto para confirmar la ruta real en serverless.",
         }
 
     # -------------------------
-    # FASE 3: Probe modelos (SIN diffusers)
+    # Probe modelos (SIN diffusers)
     # -------------------------
     if ping in ("probe_models", "probe_model", "models_probe"):
         return {
             "ok": True,
             "msg": "PROBE_OK",
-            "paths": {
-                "t2v": MODEL_T2V_LOCAL,
-                "i2v": MODEL_I2V_LOCAL,
-            },
+            "paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
             "t2v": _probe_model_tree(MODEL_T2V_LOCAL),
             "i2v": _probe_model_tree(MODEL_I2V_LOCAL),
             "gpu_info": _gpu_info(),
             **_diffusers_info(),
-            "note": "Esto no carga pipelines. Solo verifica que el volumen tenga estructura diffusers.",
+            "note": "Esto no carga pipelines. Solo verifica estructura en el filesystem del worker.",
         }
 
     # -------------------------
@@ -364,7 +447,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
         except Exception as e:
             _cuda_cleanup()
-            return {
+            out_err = {
                 "ok": False,
                 "ping": "wan_load",
                 "error": str(e),
@@ -372,15 +455,16 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 "gpu_info": _gpu_info(),
                 **_diffusers_info(),
             }
+            return out_err
 
-    # Default: echo
+    # Default: echo (tu "default eco" es esto)
     return {
         "ok": True,
-        "msg": "NO_PING_PROVIDED",
+        "msg": "DEFAULT_ECHO",
         "input": inp,
+        "resolved_paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
         "gpu_info": _gpu_info(),
         **_diffusers_info(),
     }
-
 
 runpod.serverless.start({"handler": handler})
