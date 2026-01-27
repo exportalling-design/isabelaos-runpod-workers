@@ -2,30 +2,47 @@ FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PYTHONUNBUFFERED=1
 
+# -------------------------
+# Sistema base
+# -------------------------
 RUN apt-get update && apt-get install -y \
-    python3 python3-pip python3-venv python3-dev \
-    build-essential \
-    git curl ffmpeg \
+    python3 \
+    python3-pip \
+    python3-venv \
+    git \
+    curl \
+    ffmpeg \
+    libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# ✅ Recomendado: pip actualizado
-RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel
+# -------------------------
+# Pip actualizado
+# -------------------------
+RUN python3 -m pip install --upgrade pip
 
-# ✅ Torch EXACTO del venv (CUDA 12.1)
-# (esto evita que pip instale un torch random que no calce)
-RUN pip3 install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 \
-    torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1
+# -------------------------
+# 🔥 PYTORCH CUDA 12.1 (CLAVE)
+# -------------------------
+RUN pip install --no-cache-dir \
+    torch==2.3.1+cu121 \
+    torchvision==0.18.1+cu121 \
+    torchaudio==2.3.1+cu121 \
+    --index-url https://download.pytorch.org/whl/cu121
 
-# ✅ Instalar el resto de librerías
+# -------------------------
+# Dependencias del proyecto
+# -------------------------
 COPY requirements.txt /app/requirements.txt
-RUN pip3 install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# App
+# -------------------------
+# Worker
+# -------------------------
 COPY worker.py /app/worker.py
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
