@@ -1,17 +1,15 @@
 runpod==1.7.13
 
-# Wan 2.2 (IGUAL al venv que funciona)
 diffusers==0.36.0
 transformers==4.57.3
 accelerate==1.12.0
 huggingface_hub==0.36.0
 safetensors==0.5.2
 
-# 🔥 OBLIGATORIOS
-peft>=0.17.0
+# obligatorio
+peft==0.17.0
 einops==0.8.0
 
-# Utils
 numpy==2.2.6
 Pillow==12.0.0
 opencv-python==4.12.0.88
