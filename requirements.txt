@@ -1,26 +1,18 @@
-# Core RunPod
 runpod==1.7.13
 
-# Torch (RunPod ya trae CUDA, NO fijamos torch)
-# torch viene del contenedor NVIDIA
+# ✅ Wan2.2 stack (IGUAL al venv que funciona)
+diffusers==0.36.0
+transformers==4.57.3
+accelerate==1.12.0
+huggingface_hub==0.36.0
+safetensors==0.5.2
 
-# WAN 2.2 compatible stack
-diffusers==0.30.2
-transformers==4.41.2
-accelerate==0.29.3
-
-# HuggingFace
-huggingface-hub==0.25.2
-safetensors==0.4.3
-
-# Imagen / utilidades
-Pillow==10.3.0
-numpy==1.26.4
-opencv-python-headless==4.9.0.80
-imageio==2.34.1
-imageio-ffmpeg==0.4.9
-
-# Extras necesarios para video
-einops==0.8.0
-tqdm==4.66.4
-scipy==1.11.4
+# utils
+numpy==2.2.6
+Pillow==12.0.0
+opencv-python==4.12.0.88
+imageio==2.37.2
+imageio-ffmpeg==0.6.0
+requests==2.32.3
+tqdm==4.67.1
+python-dotenv==1.1.0
