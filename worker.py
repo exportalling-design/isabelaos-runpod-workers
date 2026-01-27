@@ -64,8 +64,8 @@ def _normalize_model_path(p: str) -> str:
         p = p.replace("//", "/")
     return p
 
-DEFAULT_T2V_PATH = "/workspace/models/wan22/ti2v-5b"
-DEFAULT_I2V_PATH = "/workspace/models/wan22/i2v-a14b"
+DEFAULT_T2V_PATH = "/runpod-volume/models/wan22/ti2v-5b"
+DEFAULT_I2V_PATH = "/runpod-volume/models/wan22/i2v-a14b"
 
 MODEL_T2V_LOCAL = _normalize_model_path(os.environ.get("WAN_T2V_PATH", DEFAULT_T2V_PATH))
 MODEL_I2V_LOCAL = _normalize_model_path(os.environ.get("WAN_I2V_PATH", DEFAULT_I2V_PATH))
