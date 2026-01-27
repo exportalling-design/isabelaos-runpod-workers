@@ -51,23 +51,6 @@ if hasattr(F, "scaled_dot_product_attention"):
         return _orig_sdp(*args, **kwargs)
     F.scaled_dot_product_attention = patched_sdp_attention
 
-# --- ftfy optional (Wan/tokenizers sometimes expect it) ---
-try:
-    import ftfy  # noqa: F401
-except Exception:
-    ftfy = None
-
-def _fix_text(s: str) -> str:
-    s = (s or "").strip()
-    if not s:
-        return s
-    try:
-        if ftfy is not None:
-            return ftfy.fix_text(s)
-    except Exception:
-        pass
-    return s
-
 import runpod
 
 # ---------------------------
@@ -240,49 +223,124 @@ def _b64_to_pil_image(image_b64: str):
     img.load()
     return img.convert("RGB")
 
+# ---------------------------
+# NEW: frame normalization (fix MP4 channels)
+# ---------------------------
+def _to_uint8_hwc(frame):
+    """
+    Acepta: PIL, numpy, torch (CHW/HWC, float/uint8).
+    Devuelve numpy uint8 con shape (H,W) o (H,W,C) donde C=1/3/4.
+    """
+    import numpy as np
+
+    # PIL
+    if hasattr(frame, "convert"):
+        arr = np.array(frame.convert("RGB"), dtype=np.uint8)
+        return arr
+
+    # torch -> numpy
+    if torch.is_tensor(frame):
+        t = frame.detach().float().cpu()
+        arr = t.numpy()
+    else:
+        arr = np.asarray(frame)
+
+    # quitar batch dims si vienen
+    # (1, F, C, H, W) o (F, C, H, W) o (1, C, H, W)
+    while arr.ndim >= 4 and arr.shape[0] == 1:
+        arr = arr[0]
+
+    # si viene (C,H,W) -> (H,W,C)
+    if arr.ndim == 3:
+        c_first = arr.shape[0] in (1, 3, 4)
+        c_last_ok = arr.shape[-1] in (1, 3, 4)
+        if c_first and not c_last_ok:
+            arr = np.transpose(arr, (1, 2, 0))
+
+    # si viene (H,W,C) pero C raro, intenta detectar (C,H,W) mal interpretado
+    if arr.ndim == 3 and arr.shape[-1] not in (1, 2, 3, 4) and arr.shape[0] in (1, 3, 4):
+        arr = np.transpose(arr, (1, 2, 0))
+
+    # si float en 0..1 -> 0..255
+    if arr.dtype != np.uint8:
+        mx = float(np.max(arr)) if arr.size else 0.0
+        if mx <= 1.5:
+            arr = arr * 255.0
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+    # si alpha 4 canales ok; si 2 canales también ok; si 1 canal ok
+    if arr.ndim == 3 and arr.shape[-1] == 2:
+        # raro pero permitido por imageio; lo dejamos
+        return arr
+
+    if arr.ndim == 3 and arr.shape[-1] not in (1, 2, 3, 4):
+        raise RuntimeError(f"BAD_FRAME_CHANNELS: shape={arr.shape} dtype={arr.dtype}")
+
+    return arr
+
+def _normalize_frames(frames):
+    """
+    frames puede venir:
+    - list[PIL/np/torch]
+    - torch tensor (F,C,H,W) o (1,F,C,H,W) o (F,H,W,C)
+    - numpy array idem
+    Devuelve list[np.uint8 HWC]
+    """
+    import numpy as np
+
+    if torch.is_tensor(frames):
+        arr = frames.detach().cpu()
+        arr = arr.numpy()
+        frames = arr
+
+    if isinstance(frames, np.ndarray):
+        # squeeze leading 1
+        while frames.ndim >= 5 and frames.shape[0] == 1:
+            frames = frames[0]
+
+        # (F,C,H,W) -> iter por F
+        if frames.ndim == 4:
+            out = []
+            for i in range(frames.shape[0]):
+                out.append(_to_uint8_hwc(frames[i]))
+            return out
+
+        # (F,H,W,C)
+        if frames.ndim == 4:
+            out = []
+            for i in range(frames.shape[0]):
+                out.append(_to_uint8_hwc(frames[i]))
+            return out
+
+    # list/iterable
+    out = []
+    for f in frames:
+        out.append(_to_uint8_hwc(f))
+    return out
+
 def _frames_to_mp4_bytes(frames, fps: int = 24) -> bytes:
     """
     Convierte frames a mp4 bytes en memoria.
-    Requiere imageio + ffmpeg. Si falla, devolvemos un error claro.
+    FIX: normaliza a uint8 HWC antes de escribir.
     """
-    import numpy as np
     import imageio.v2 as imageio
     import tempfile
-    import os as _os
 
-    tmp_path = None
-    try:
-        fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
-        _os.close(fd)
+    frames_u8 = _normalize_frames(frames)
 
-        writer = imageio.get_writer(tmp_path, fps=fps, codec="libx264", quality=8)
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=True) as tmp:
+        writer = imageio.get_writer(tmp.name, fps=fps, codec="libx264", quality=8)
         try:
-            for f in frames:
-                if hasattr(f, "convert"):  # PIL
-                    arr = np.array(f.convert("RGB"))
-                else:
-                    arr = f
+            for arr in frames_u8:
                 writer.append_data(arr)
         finally:
             writer.close()
 
-        with open(tmp_path, "rb") as f:
-            return f.read()
-
-    except Exception as e:
-        # Usualmente aquí cae si falta ffmpeg / imageio-ffmpeg
-        raise RuntimeError(
-            f"MP4_ENCODE_FAILED: {e}. "
-            "Si estás en tu propio Dockerfile, asegurate de instalar: imageio-ffmpeg y/o ffmpeg."
-        )
-    finally:
-        if tmp_path and _os.path.exists(tmp_path):
-            try:
-                _os.remove(tmp_path)
-            except Exception:
-                pass
+        tmp.seek(0)
+        return tmp.read()
 
 def _extract_frames(result):
+    # dict-like
     if isinstance(result, dict):
         for k in ("frames", "videos", "video"):
             if k in result:
@@ -291,6 +349,7 @@ def _extract_frames(result):
                     return v[0]
                 return v
 
+    # object attrs
     for k in ("frames", "videos", "video"):
         if hasattr(result, k):
             v = getattr(result, k)
@@ -298,26 +357,13 @@ def _extract_frames(result):
                 return v[0]
             return v
 
+    # index fallback
     try:
-        v = result[0]
-        if isinstance(v, list) and len(v) == 1 and isinstance(v[0], list):
-            return v[0]
-        return v
+        return result[0]
     except Exception:
         pass
 
     raise RuntimeError(f"Could not extract frames from result type={type(result)}")
-
-def _frames_multiple_of_4(n: int) -> int:
-    n = int(n)
-    if n <= 0:
-        return 16
-    # Wan exige múltiplo de 4
-    if n % 4 != 0:
-        n = 4 * round(n / 4)
-        if n <= 0:
-            n = 16
-    return n
 
 # ---------------------------
 # Pipelines
@@ -462,26 +508,33 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
     # ---- debug ----
     if ping in ("echo", "debug"):
+        # ftfy a veces lo requiere internamente; lo “tocamos” para validar disponibilidad
+        ftfy_ok = True
+        try:
+            import ftfy  # noqa
+        except Exception:
+            ftfy_ok = False
+
         return {
             "ok": True,
             "msg": "ECHO_OK",
             "job_keys": list(job.keys()),
             "input": inp,
             "gpu_info": _gpu_info(),
+            "ftfy_available": ftfy_ok,
             **_diffusers_info(),
             "env": {
                 "WAN_T2V_PATH": os.environ.get("WAN_T2V_PATH"),
                 "WAN_I2V_PATH": os.environ.get("WAN_I2V_PATH"),
             },
             "resolved_paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
-            "ftfy_available": ftfy is not None,
         }
 
     if ping == "smoke":
-        return {"ok": True, "msg": "SMOKE_OK", "gpu_info": _gpu_info(), **_diffusers_info(), "ftfy_available": ftfy is not None}
+        return {"ok": True, "msg": "SMOKE_OK", "gpu_info": _gpu_info(), **_diffusers_info()}
 
     if ping == "gpu_sanity":
-        return {"ok": True, **_gpu_info(), **_diffusers_info(), "ftfy_available": ftfy is not None}
+        return {"ok": True, **_gpu_info(), **_diffusers_info()}
 
     # ---- list paths ----
     if ping == "list_paths":
@@ -504,7 +557,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         out["gpu_info"] = _gpu_info()
         out.update(_diffusers_info())
         out["resolved_paths"] = {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL}
-        out["ftfy_available"] = ftfy is not None
         return out
 
     if ping == "find_wan_models":
@@ -525,7 +577,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             "found_model_dirs": found,
             "gpu_info": _gpu_info(),
             **_diffusers_info(),
-            "ftfy_available": ftfy is not None,
         }
 
     if ping in ("probe_models", "probe_model", "models_probe"):
@@ -537,7 +588,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             "i2v": _probe_model_tree(MODEL_I2V_LOCAL),
             "gpu_info": _gpu_info(),
             **_diffusers_info(),
-            "ftfy_available": ftfy is not None,
         }
 
     # ---- load only ----
@@ -562,11 +612,10 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 **_diffusers_info(),
                 "seconds": round(time.time() - t0, 3),
                 "note": "Loaded pipeline only. No inference performed.",
-                "ftfy_available": ftfy is not None,
             }
         except Exception as e:
             _hard_cleanup()
-            return {"ok": False, "ping": "wan_load", "error": str(e), "gpu_info": _gpu_info(), **_diffusers_info(), "ftfy_available": ftfy is not None}
+            return {"ok": False, "ping": "wan_load", "error": str(e), "gpu_info": _gpu_info(), **_diffusers_info()}
 
     # ---- image debug ----
     if ping == "image_debug":
@@ -597,10 +646,10 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     # ---- I2V generate ----
     if ping in ("i2v_generate", "wan_i2v_generate"):
         image_b64 = inp.get("image_b64") or inp.get("image")
-        prompt = _fix_text(str(inp.get("prompt") or "cinematic, ultra realistic, high quality"))
-        negative = _fix_text(str(inp.get("negative") or ""))
+        prompt = str(inp.get("prompt") or "cinematic, ultra realistic, high quality").strip()
+        negative = str(inp.get("negative") or "").strip()
 
-        num_frames = _frames_multiple_of_4(int(inp.get("frames") or inp.get("num_frames") or 16))
+        num_frames = int(inp.get("frames") or inp.get("num_frames") or 16)
         fps = int(inp.get("fps") or 24)
         steps = int(inp.get("steps") or inp.get("num_inference_steps") or 14)
         guidance = float(inp.get("guidance") or inp.get("guidance_scale") or 4.0)
@@ -634,14 +683,21 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             )
 
             frames = _extract_frames(result)
-            mp4_bytes = _frames_to_mp4_bytes(frames, fps=fps)
+
+            try:
+                mp4_bytes = _frames_to_mp4_bytes(frames, fps=fps)
+            except Exception as enc_e:
+                raise RuntimeError(
+                    f"MP4_ENCODE_FAILED: {enc_e}. "
+                    "Tip: frames deben convertirse a HWC uint8 (ya lo hacemos) - si sigue fallando, dime shape del frame."
+                )
+
             video_b64 = base64.b64encode(mp4_bytes).decode("utf-8")
 
             return {
                 "ok": True,
                 "ping": ping,
                 "video_b64": video_b64,
-                "video_bytes_len": len(mp4_bytes),
                 "seconds": round(time.time() - t0, 3),
                 "gpu_info": _gpu_info(),
                 **_diffusers_info(),
@@ -654,26 +710,24 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     "width": width,
                     "seed": seed,
                 },
-                "ftfy_available": ftfy is not None,
                 "note": "video_b64 es mp4 en base64. Súbelo a Supabase desde tu API (como Flux).",
             }
 
         except torch.cuda.OutOfMemoryError as e:
             _hard_cleanup()
-            return {"ok": False, "ping": ping, "error": f"CUDA OOM: {str(e)}", "gpu_info": _gpu_info(), **_diffusers_info(), "ftfy_available": ftfy is not None}
+            return {"ok": False, "ping": ping, "error": f"CUDA OOM: {str(e)}", "gpu_info": _gpu_info(), **_diffusers_info()}
         except Exception as e:
             _hard_cleanup()
-            return {"ok": False, "ping": ping, "error": str(e), "gpu_info": _gpu_info(), **_diffusers_info(), "ftfy_available": ftfy is not None}
+            return {"ok": False, "ping": ping, "error": str(e), "gpu_info": _gpu_info(), **_diffusers_info()}
 
-    # ---- T2V generate (prompt -> video) ----
+    # ---- T2V generate ----
     if ping in ("t2v_generate", "wan_t2v_generate"):
-        prompt = _fix_text(str(inp.get("prompt") or ""))
-        negative = _fix_text(str(inp.get("negative") or ""))
-
+        prompt = str(inp.get("prompt") or "").strip()
+        negative = str(inp.get("negative") or "").strip()
         if not prompt:
             return {"ok": False, "ping": ping, "error": "missing prompt", "gpu_info": _gpu_info(), **_diffusers_info()}
 
-        num_frames = _frames_multiple_of_4(int(inp.get("frames") or inp.get("num_frames") or 16))
+        num_frames = int(inp.get("frames") or inp.get("num_frames") or 16)
         fps = int(inp.get("fps") or 24)
         steps = int(inp.get("steps") or inp.get("num_inference_steps") or 14)
         guidance = float(inp.get("guidance") or inp.get("guidance_scale") or 4.0)
@@ -709,7 +763,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 "ok": True,
                 "ping": ping,
                 "video_b64": video_b64,
-                "video_bytes_len": len(mp4_bytes),
                 "seconds": round(time.time() - t0, 3),
                 "gpu_info": _gpu_info(),
                 **_diffusers_info(),
@@ -722,16 +775,15 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     "width": width,
                     "seed": seed,
                 },
-                "ftfy_available": ftfy is not None,
                 "note": "video_b64 es mp4 en base64. Súbelo a Supabase desde tu API (como Flux).",
             }
 
         except torch.cuda.OutOfMemoryError as e:
             _hard_cleanup()
-            return {"ok": False, "ping": ping, "error": f"CUDA OOM: {str(e)}", "gpu_info": _gpu_info(), **_diffusers_info(), "ftfy_available": ftfy is not None}
+            return {"ok": False, "ping": ping, "error": f"CUDA OOM: {str(e)}", "gpu_info": _gpu_info(), **_diffusers_info()}
         except Exception as e:
             _hard_cleanup()
-            return {"ok": False, "ping": ping, "error": str(e), "gpu_info": _gpu_info(), **_diffusers_info(), "ftfy_available": ftfy is not None}
+            return {"ok": False, "ping": ping, "error": str(e), "gpu_info": _gpu_info(), **_diffusers_info()}
 
     # Default
     return {
@@ -741,7 +793,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         "resolved_paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
         "gpu_info": _gpu_info(),
         **_diffusers_info(),
-        "ftfy_available": ftfy is not None,
     }
 
 runpod.serverless.start({"handler": handler})
