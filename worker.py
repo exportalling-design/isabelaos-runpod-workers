@@ -223,70 +223,116 @@ def _b64_to_pil_image(image_b64: str):
     img.load()
     return img.convert("RGB")
 
-# --------- Channel-safe frame conversion ----------
-def _to_uint8_rgb(frame):
+# ---------------------------
+# NEW: frame normalization (fix MP4 channels)
+# ---------------------------
+def _to_uint8_hwc(frame):
     """
-    Devuelve np.uint8 con shape (H,W,3)
-    Acepta: PIL, np arrays 2D/3D, torch tensors.
+    Acepta: PIL, numpy, torch (CHW/HWC, float/uint8).
+    Devuelve numpy uint8 con shape (H,W) o (H,W,C) donde C=1/3/4.
     """
     import numpy as np
 
     # PIL
     if hasattr(frame, "convert"):
-        return np.array(frame.convert("RGB"), dtype=np.uint8)
-
-    # torch tensor -> numpy
-    if hasattr(frame, "detach"):
-        frame = frame.detach().cpu().numpy()
-
-    arr = np.array(frame)
-
-    # Si es float [0..1] o float grande, lo llevamos a uint8
-    if arr.dtype != np.uint8:
-        # intenta normalizar suavemente
-        if arr.max() <= 1.0:
-            arr = (arr * 255.0).clip(0, 255)
-        else:
-            arr = arr.clip(0, 255)
-        arr = arr.astype(np.uint8)
-
-    # 2D -> 3 canales
-    if arr.ndim == 2:
-        arr = np.stack([arr, arr, arr], axis=-1)
-
-    # 3D -> validar canales
-    if arr.ndim == 3:
-        c = arr.shape[-1]
-        if c == 1:
-            arr = np.repeat(arr, 3, axis=-1)
-        elif c == 2:
-            # raro, pero convertimos a 3 usando los 2 primeros y duplicando el primero
-            arr = np.concatenate([arr, arr[..., :1]], axis=-1)
-        elif c == 3:
-            pass
-        elif c == 4:
-            # RGBA -> RGB
-            arr = arr[..., :3]
-        else:
-            raise RuntimeError(f"FRAME_CHANNELS_UNSUPPORTED: channels={c}, shape={arr.shape}")
-
+        arr = np.array(frame.convert("RGB"), dtype=np.uint8)
         return arr
 
-    raise RuntimeError(f"FRAME_SHAPE_UNSUPPORTED: ndim={arr.ndim}, shape={arr.shape}")
+    # torch -> numpy
+    if torch.is_tensor(frame):
+        t = frame.detach().float().cpu()
+        arr = t.numpy()
+    else:
+        arr = np.asarray(frame)
+
+    # quitar batch dims si vienen
+    # (1, F, C, H, W) o (F, C, H, W) o (1, C, H, W)
+    while arr.ndim >= 4 and arr.shape[0] == 1:
+        arr = arr[0]
+
+    # si viene (C,H,W) -> (H,W,C)
+    if arr.ndim == 3:
+        c_first = arr.shape[0] in (1, 3, 4)
+        c_last_ok = arr.shape[-1] in (1, 3, 4)
+        if c_first and not c_last_ok:
+            arr = np.transpose(arr, (1, 2, 0))
+
+    # si viene (H,W,C) pero C raro, intenta detectar (C,H,W) mal interpretado
+    if arr.ndim == 3 and arr.shape[-1] not in (1, 2, 3, 4) and arr.shape[0] in (1, 3, 4):
+        arr = np.transpose(arr, (1, 2, 0))
+
+    # si float en 0..1 -> 0..255
+    if arr.dtype != np.uint8:
+        mx = float(np.max(arr)) if arr.size else 0.0
+        if mx <= 1.5:
+            arr = arr * 255.0
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+    # si alpha 4 canales ok; si 2 canales también ok; si 1 canal ok
+    if arr.ndim == 3 and arr.shape[-1] == 2:
+        # raro pero permitido por imageio; lo dejamos
+        return arr
+
+    if arr.ndim == 3 and arr.shape[-1] not in (1, 2, 3, 4):
+        raise RuntimeError(f"BAD_FRAME_CHANNELS: shape={arr.shape} dtype={arr.dtype}")
+
+    return arr
+
+def _normalize_frames(frames):
+    """
+    frames puede venir:
+    - list[PIL/np/torch]
+    - torch tensor (F,C,H,W) o (1,F,C,H,W) o (F,H,W,C)
+    - numpy array idem
+    Devuelve list[np.uint8 HWC]
+    """
+    import numpy as np
+
+    if torch.is_tensor(frames):
+        arr = frames.detach().cpu()
+        arr = arr.numpy()
+        frames = arr
+
+    if isinstance(frames, np.ndarray):
+        # squeeze leading 1
+        while frames.ndim >= 5 and frames.shape[0] == 1:
+            frames = frames[0]
+
+        # (F,C,H,W) -> iter por F
+        if frames.ndim == 4:
+            out = []
+            for i in range(frames.shape[0]):
+                out.append(_to_uint8_hwc(frames[i]))
+            return out
+
+        # (F,H,W,C)
+        if frames.ndim == 4:
+            out = []
+            for i in range(frames.shape[0]):
+                out.append(_to_uint8_hwc(frames[i]))
+            return out
+
+    # list/iterable
+    out = []
+    for f in frames:
+        out.append(_to_uint8_hwc(f))
+    return out
 
 def _frames_to_mp4_bytes(frames, fps: int = 24) -> bytes:
     """
-    Convierte frames a mp4 bytes en memoria (sin volumen).
-    Requiere ffmpeg (ya lo instalaste) y imageio.
+    Convierte frames a mp4 bytes en memoria.
+    FIX: normaliza a uint8 HWC antes de escribir.
     """
     import imageio.v2 as imageio
     import tempfile
 
+    frames_u8 = _normalize_frames(frames)
+
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=True) as tmp:
         writer = imageio.get_writer(tmp.name, fps=fps, codec="libx264", quality=8)
         try:
-            for f in frames:
-                writer.append_data(_to_uint8_rgb(f))
+            for arr in frames_u8:
+                writer.append_data(arr)
         finally:
             writer.close()
 
@@ -313,10 +359,7 @@ def _extract_frames(result):
 
     # index fallback
     try:
-        v = result[0]
-        if isinstance(v, list) and len(v) == 1 and isinstance(v[0], list):
-            return v[0]
-        return v
+        return result[0]
     except Exception:
         pass
 
@@ -428,7 +471,7 @@ def _load_i2v(unload_other: bool = True):
     return _pipe_i2v
 
 # ---------------------------
-# Find model_index.json
+# Find / list volume paths
 # ---------------------------
 def _walk_find_model_index(root: str, max_depth: int = 4, limit: int = 50) -> List[str]:
     hits = []
@@ -465,12 +508,20 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
     # ---- debug ----
     if ping in ("echo", "debug"):
+        # ftfy a veces lo requiere internamente; lo “tocamos” para validar disponibilidad
+        ftfy_ok = True
+        try:
+            import ftfy  # noqa
+        except Exception:
+            ftfy_ok = False
+
         return {
             "ok": True,
             "msg": "ECHO_OK",
             "job_keys": list(job.keys()),
             "input": inp,
             "gpu_info": _gpu_info(),
+            "ftfy_available": ftfy_ok,
             **_diffusers_info(),
             "env": {
                 "WAN_T2V_PATH": os.environ.get("WAN_T2V_PATH"),
@@ -632,7 +683,15 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             )
 
             frames = _extract_frames(result)
-            mp4_bytes = _frames_to_mp4_bytes(frames, fps=fps)
+
+            try:
+                mp4_bytes = _frames_to_mp4_bytes(frames, fps=fps)
+            except Exception as enc_e:
+                raise RuntimeError(
+                    f"MP4_ENCODE_FAILED: {enc_e}. "
+                    "Tip: frames deben convertirse a HWC uint8 (ya lo hacemos) - si sigue fallando, dime shape del frame."
+                )
+
             video_b64 = base64.b64encode(mp4_bytes).decode("utf-8")
 
             return {
@@ -642,7 +701,15 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 "seconds": round(time.time() - t0, 3),
                 "gpu_info": _gpu_info(),
                 **_diffusers_info(),
-                "params": {"frames": num_frames, "fps": fps, "steps": steps, "guidance": guidance, "height": height, "width": width, "seed": seed},
+                "params": {
+                    "frames": num_frames,
+                    "fps": fps,
+                    "steps": steps,
+                    "guidance": guidance,
+                    "height": height,
+                    "width": width,
+                    "seed": seed,
+                },
                 "note": "video_b64 es mp4 en base64. Súbelo a Supabase desde tu API (como Flux).",
             }
 
@@ -653,7 +720,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             _hard_cleanup()
             return {"ok": False, "ping": ping, "error": str(e), "gpu_info": _gpu_info(), **_diffusers_info()}
 
-    # ---- T2V generate (prompt -> video) ----
+    # ---- T2V generate ----
     if ping in ("t2v_generate", "wan_t2v_generate"):
         prompt = str(inp.get("prompt") or "").strip()
         negative = str(inp.get("negative") or "").strip()
@@ -699,7 +766,15 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 "seconds": round(time.time() - t0, 3),
                 "gpu_info": _gpu_info(),
                 **_diffusers_info(),
-                "params": {"frames": num_frames, "fps": fps, "steps": steps, "guidance": guidance, "height": height, "width": width, "seed": seed},
+                "params": {
+                    "frames": num_frames,
+                    "fps": fps,
+                    "steps": steps,
+                    "guidance": guidance,
+                    "height": height,
+                    "width": width,
+                    "seed": seed,
+                },
                 "note": "video_b64 es mp4 en base64. Súbelo a Supabase desde tu API (como Flux).",
             }
 
