@@ -1,8 +1,18 @@
+# RunPod
 runpod==1.7.13
-diffusers==0.32.2
-transformers==4.48.3
-accelerate==1.3.0
-safetensors==0.5.2
-huggingface_hub==0.27.1
-Pillow==10.4.0
+
+# 🔥 DIFFUSERS (WAN REQUIRED)
+diffusers @ git+https://github.com/huggingface/diffusers.git@main
+
+# HuggingFace stack
+transformers>=4.38.0
+accelerate>=0.27.0
+huggingface_hub>=0.20.3
+safetensors>=0.4.2
+
+# Core numeric / image
 numpy==1.26.4
+Pillow>=10.0.0
+
+# Torch (NO instalar torch aquí, ya viene en la imagen CUDA)
+# torch viene del nvidia/cuda base image
