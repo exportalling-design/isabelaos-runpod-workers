@@ -1,3 +1,5 @@
 #!/bin/bash
 set -e
-python3 /app/worker.py
+
+echo "[ENTRYPOINT] starting worker..."
+exec python3 -u /app/worker.py
