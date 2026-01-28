@@ -1,3 +1,4 @@
+# worker.py (RunPod Serverless)
 import os
 import time
 import gc
@@ -224,13 +225,9 @@ def _b64_to_pil_image(image_b64: str):
     return img.convert("RGB")
 
 # ---------------------------
-# NEW: frame normalization (fix MP4 channels)
+# Frames -> MP4 bytes
 # ---------------------------
 def _to_uint8_hwc(frame):
-    """
-    Acepta: PIL, numpy, torch (CHW/HWC, float/uint8).
-    Devuelve numpy uint8 con shape (H,W) o (H,W,C) donde C=1/3/4.
-    """
     import numpy as np
 
     # PIL
@@ -238,40 +235,31 @@ def _to_uint8_hwc(frame):
         arr = np.array(frame.convert("RGB"), dtype=np.uint8)
         return arr
 
-    # torch -> numpy
     if torch.is_tensor(frame):
         t = frame.detach().float().cpu()
         arr = t.numpy()
     else:
         arr = np.asarray(frame)
 
-    # quitar batch dims si vienen
-    # (1, F, C, H, W) o (F, C, H, W) o (1, C, H, W)
+    # squeeze leading 1
     while arr.ndim >= 4 and arr.shape[0] == 1:
         arr = arr[0]
 
-    # si viene (C,H,W) -> (H,W,C)
+    # (C,H,W) -> (H,W,C)
     if arr.ndim == 3:
         c_first = arr.shape[0] in (1, 3, 4)
         c_last_ok = arr.shape[-1] in (1, 3, 4)
         if c_first and not c_last_ok:
             arr = np.transpose(arr, (1, 2, 0))
 
-    # si viene (H,W,C) pero C raro, intenta detectar (C,H,W) mal interpretado
     if arr.ndim == 3 and arr.shape[-1] not in (1, 2, 3, 4) and arr.shape[0] in (1, 3, 4):
         arr = np.transpose(arr, (1, 2, 0))
 
-    # si float en 0..1 -> 0..255
     if arr.dtype != np.uint8:
         mx = float(np.max(arr)) if arr.size else 0.0
         if mx <= 1.5:
             arr = arr * 255.0
         arr = np.clip(arr, 0, 255).astype(np.uint8)
-
-    # si alpha 4 canales ok; si 2 canales también ok; si 1 canal ok
-    if arr.ndim == 3 and arr.shape[-1] == 2:
-        # raro pero permitido por imageio; lo dejamos
-        return arr
 
     if arr.ndim == 3 and arr.shape[-1] not in (1, 2, 3, 4):
         raise RuntimeError(f"BAD_FRAME_CHANNELS: shape={arr.shape} dtype={arr.dtype}")
@@ -279,50 +267,26 @@ def _to_uint8_hwc(frame):
     return arr
 
 def _normalize_frames(frames):
-    """
-    frames puede venir:
-    - list[PIL/np/torch]
-    - torch tensor (F,C,H,W) o (1,F,C,H,W) o (F,H,W,C)
-    - numpy array idem
-    Devuelve list[np.uint8 HWC]
-    """
     import numpy as np
 
     if torch.is_tensor(frames):
-        arr = frames.detach().cpu()
-        arr = arr.numpy()
-        frames = arr
+        frames = frames.detach().cpu().numpy()
 
     if isinstance(frames, np.ndarray):
-        # squeeze leading 1
         while frames.ndim >= 5 and frames.shape[0] == 1:
             frames = frames[0]
-
-        # (F,C,H,W) -> iter por F
         if frames.ndim == 4:
             out = []
             for i in range(frames.shape[0]):
                 out.append(_to_uint8_hwc(frames[i]))
             return out
 
-        # (F,H,W,C)
-        if frames.ndim == 4:
-            out = []
-            for i in range(frames.shape[0]):
-                out.append(_to_uint8_hwc(frames[i]))
-            return out
-
-    # list/iterable
     out = []
     for f in frames:
         out.append(_to_uint8_hwc(f))
     return out
 
 def _frames_to_mp4_bytes(frames, fps: int = 24) -> bytes:
-    """
-    Convierte frames a mp4 bytes en memoria.
-    FIX: normaliza a uint8 HWC antes de escribir.
-    """
     import imageio.v2 as imageio
     import tempfile
 
@@ -340,7 +304,6 @@ def _frames_to_mp4_bytes(frames, fps: int = 24) -> bytes:
         return tmp.read()
 
 def _extract_frames(result):
-    # dict-like
     if isinstance(result, dict):
         for k in ("frames", "videos", "video"):
             if k in result:
@@ -349,7 +312,6 @@ def _extract_frames(result):
                     return v[0]
                 return v
 
-    # object attrs
     for k in ("frames", "videos", "video"):
         if hasattr(result, k):
             v = getattr(result, k)
@@ -357,7 +319,6 @@ def _extract_frames(result):
                 return v[0]
             return v
 
-    # index fallback
     try:
         return result[0]
     except Exception:
@@ -366,7 +327,7 @@ def _extract_frames(result):
     raise RuntimeError(f"Could not extract frames from result type={type(result)}")
 
 # ---------------------------
-# PATCH: timing + aspect/platform helpers (3s/5s, formats)
+# Timing + Dims helpers (3s/5s + /16)
 # ---------------------------
 def _clamp_int(v, lo: int, hi: int, default: int) -> int:
     try:
@@ -374,6 +335,12 @@ def _clamp_int(v, lo: int, hi: int, default: int) -> int:
     except Exception:
         return default
     return max(lo, min(hi, n))
+
+def _snap16(n: int) -> int:
+    n = int(n)
+    # round to nearest multiple of 16
+    r = int(round(n / 16.0) * 16)
+    return max(16, r)
 
 def _pick_dims(width, height, aspect_ratio: str = "", platform_ref: str = "") -> Tuple[int, int]:
     # 1) Si vienen width/height válidos, respétalos
@@ -414,18 +381,12 @@ def _pick_dims(width, height, aspect_ratio: str = "", platform_ref: str = "") ->
     return 768, 432
 
 def _normalize_timing(inp: Dict[str, Any]) -> Tuple[int, int, int]:
-    """
-    Devuelve (seconds, fps, num_frames)
-    Regla: SOLO 3s o 5s por ahora.
-    Acepta: duration_s | seconds, fps, frames | num_frames
-    """
     seconds_raw = inp.get("duration_s", None)
     if seconds_raw is None:
         seconds_raw = inp.get("seconds", None)
     if seconds_raw is None:
         seconds_raw = 4
 
-    # clamp 3..5 y luego forzamos solo 3 o 5
     seconds = _clamp_int(seconds_raw, 3, 5, 3)
     seconds = 3 if seconds < 4 else 5
 
@@ -438,7 +399,6 @@ def _normalize_timing(inp: Dict[str, Any]) -> Tuple[int, int, int]:
         nf_raw = seconds * fps
 
     num_frames = _clamp_int(nf_raw, 1, 9999, seconds * fps)
-
     return seconds, fps, num_frames
 
 # ---------------------------
@@ -547,33 +507,124 @@ def _load_i2v(unload_other: bool = True):
     return _pipe_i2v
 
 # ---------------------------
-# Find / list volume paths
+# Generators
 # ---------------------------
-def _walk_find_model_index(root: str, max_depth: int = 4, limit: int = 50) -> List[str]:
-    hits = []
-    root = root.rstrip("/")
-    if not os.path.isdir(root):
-        return hits
+def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
+    pipe = _load_t2v(unload_other=True)
 
-    queue: List[Tuple[str, int]] = [(root, 0)]
-    while queue and len(hits) < limit:
-        cur, depth = queue.pop(0)
-        if depth > max_depth:
-            continue
-        try:
-            items = os.listdir(cur)
-        except Exception:
-            continue
+    prompt = str(inp.get("prompt") or "").strip()
+    if not prompt:
+        raise RuntimeError("Falta prompt")
 
-        if "model_index.json" in items:
-            hits.append(cur)
-            continue
+    negative = str(inp.get("negative_prompt") or "").strip()
+    platform_ref = str(inp.get("platform_ref") or "")
+    aspect_ratio = str(inp.get("aspect_ratio") or "")
 
-        for name in items:
-            p = os.path.join(cur, name)
-            if os.path.isdir(p):
-                queue.append((p, depth + 1))
-    return hits
+    seconds, fps, num_frames = _normalize_timing(inp)
+    width_raw, height_raw = _pick_dims(inp.get("width"), inp.get("height"), aspect_ratio, platform_ref)
+
+    # ✅ SNAP /16 (esto evita el error: width/height must be divisible by 16)
+    width = _snap16(width_raw)
+    height = _snap16(height_raw)
+
+    steps = _clamp_int(inp.get("steps", 20), 1, 80, 20)
+    guidance_scale = float(inp.get("guidance_scale", 5.0) or 5.0)
+
+    t0 = time.time()
+    with torch.inference_mode():
+        result = pipe(
+            prompt=prompt,
+            negative_prompt=negative if negative else None,
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            num_inference_steps=steps,
+            guidance_scale=guidance_scale,
+        )
+
+    frames = _extract_frames(result)
+    mp4_bytes = _frames_to_mp4_bytes(frames, fps=fps)
+    mp4_b64 = base64.b64encode(mp4_bytes).decode("utf-8")
+
+    return {
+        "ok": True,
+        "mode": "t2v",
+        "width": width,
+        "height": height,
+        "seconds": seconds,
+        "fps": fps,
+        "num_frames": num_frames,
+        "steps": steps,
+        "guidance_scale": guidance_scale,
+        "elapsed_s": round(time.time() - t0, 3),
+        # ✅ lo importante:
+        "video_b64": mp4_b64,
+        "video_mime": "video/mp4",
+    }
+
+def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
+    pipe = _load_i2v(unload_other=True)
+
+    prompt = str(inp.get("prompt") or "").strip()
+    if not prompt:
+        raise RuntimeError("Falta prompt")
+
+    image_b64 = inp.get("image_b64") or inp.get("image") or inp.get("init_image_b64")
+    if not image_b64:
+        raise RuntimeError("Falta image_b64")
+
+    init_img = _b64_to_pil_image(str(image_b64))
+
+    negative = str(inp.get("negative_prompt") or "").strip()
+    platform_ref = str(inp.get("platform_ref") or "")
+    aspect_ratio = str(inp.get("aspect_ratio") or "")
+
+    seconds, fps, num_frames = _normalize_timing(inp)
+    width_raw, height_raw = _pick_dims(inp.get("width"), inp.get("height"), aspect_ratio, platform_ref)
+
+    width = _snap16(width_raw)
+    height = _snap16(height_raw)
+
+    steps = _clamp_int(inp.get("steps", 20), 1, 80, 20)
+    guidance_scale = float(inp.get("guidance_scale", 5.0) or 5.0)
+
+    # (opcional) resize init image al tamaño que pedimos
+    try:
+        init_img = init_img.resize((width, height))
+    except Exception:
+        pass
+
+    t0 = time.time()
+    with torch.inference_mode():
+        result = pipe(
+            prompt=prompt,
+            image=init_img,
+            negative_prompt=negative if negative else None,
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            num_inference_steps=steps,
+            guidance_scale=guidance_scale,
+        )
+
+    frames = _extract_frames(result)
+    mp4_bytes = _frames_to_mp4_bytes(frames, fps=fps)
+    mp4_b64 = base64.b64encode(mp4_bytes).decode("utf-8")
+
+    return {
+        "ok": True,
+        "mode": "i2v",
+        "width": width,
+        "height": height,
+        "seconds": seconds,
+        "fps": fps,
+        "num_frames": num_frames,
+        "steps": steps,
+        "guidance_scale": guidance_scale,
+        "elapsed_s": round(time.time() - t0, 3),
+        "video_b64": mp4_b64,
+        "video_mime": "video/mp4",
+    }
 
 # ---------------------------
 # Handler
@@ -582,10 +633,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     inp = job.get("input") or {}
     ping = str(inp.get("ping") or "").strip().lower()
 
-    # ---------------------------------------------------------
-    # ✅ PATCH: compatibilidad con API que manda "mode"
-    # Si viene mode=t2v o mode=i2v, lo convertimos a ping interno.
-    # ---------------------------------------------------------
+    # ✅ compat con tu backend: mode=t2v/i2v
     mode = str(inp.get("mode") or "").strip().lower()
     if not ping and mode:
         if mode == "t2v":
@@ -595,7 +643,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
     # ---- debug ----
     if ping in ("echo", "debug"):
-        # ftfy a veces lo requiere internamente; lo “tocamos” para validar disponibilidad
         ftfy_ok = True
         try:
             import ftfy  # noqa
@@ -623,7 +670,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     if ping == "gpu_sanity":
         return {"ok": True, **_gpu_info(), **_diffusers_info()}
 
-    # ---- list paths ----
     if ping == "list_paths":
         candidates = [
             "/",
@@ -646,26 +692,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         out["resolved_paths"] = {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL}
         return out
 
-    if ping == "find_wan_models":
-        roots = inp.get("roots") or ["/runpod-volume/models", "/runpod-volume", "/workspace/models", "/workspace"]
-        max_depth = int(inp.get("max_depth") or 6)
-        limit = int(inp.get("limit") or 80)
-
-        found = {}
-        for r in roots:
-            found[str(r)] = _walk_find_model_index(str(r), max_depth=max_depth, limit=limit)
-
-        return {
-            "ok": True,
-            "msg": "FIND_WAN_MODELS_OK",
-            "roots": roots,
-            "max_depth": max_depth,
-            "limit": limit,
-            "found_model_dirs": found,
-            "gpu_info": _gpu_info(),
-            **_diffusers_info(),
-        }
-
     if ping in ("probe_models", "probe_model", "models_probe"):
         return {
             "ok": True,
@@ -682,225 +708,36 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         which = str(inp.get("which") or "i2v").strip().lower()
         if which not in ("t2v", "i2v"):
             which = "i2v"
+        t0 = time.time()
+        if which == "i2v":
+            _load_i2v(unload_other=True)
+        else:
+            _load_t2v(unload_other=True)
+        return {"ok": True, "msg": f"WAN_LOAD_OK:{which}", "elapsed_s": round(time.time() - t0, 3), "gpu_info": _gpu_info()}
 
-        try:
-            t0 = time.time()
-            if which == "i2v":
-                _load_i2v(unload_other=True)
-            else:
-                _load_t2v(unload_other=True)
+    # ---- GENERATION ----
+    try:
+        if ping == "t2v_generate":
+            out = _t2v_generate(inp)
+            return out
 
-            return {
-                "ok": True,
-                "ping": "wan_load",
-                "which": which,
-                "paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
-                "gpu_info": _gpu_info(),
-                **_diffusers_info(),
-                "seconds": round(time.time() - t0, 3),
-                "note": "Loaded pipeline only. No inference performed.",
-            }
-        except Exception as e:
-            _hard_cleanup()
-            return {"ok": False, "ping": "wan_load", "error": str(e), "gpu_info": _gpu_info(), **_diffusers_info()}
+        if ping == "i2v_generate":
+            out = _i2v_generate(inp)
+            return out
 
-    # ---- image debug ----
-    if ping == "image_debug":
-        try:
-            from PIL import Image
-            s = str(inp.get("image_b64") or "")
-            raw = _decode_b64(s)
-            head_hex = raw[:32].hex()
-            img = Image.open(BytesIO(raw))
-            img.load()
-            return {
-                "ok": True,
-                "msg": "IMAGE_DEBUG_OK",
-                "bytes_len": len(raw),
-                "head_hex": head_hex,
-                "pil_format": img.format,
-                "mode": img.mode,
-                "size": [img.size[0], img.size[1]],
-            }
-        except Exception as e:
-            preview = None
-            try:
-                preview = (str(inp.get("image_b64") or ""))[:140]
-            except Exception:
-                pass
-            return {"ok": False, "msg": "IMAGE_DEBUG_FAIL", "error": str(e), "image_b64_preview": preview}
+        return {"ok": False, "error": f"UNKNOWN_PING: {ping or '<empty>'}", "input_keys": list(inp.keys())}
 
-    # ---- I2V generate ----
-    if ping in ("i2v_generate", "wan_i2v_generate"):
-        image_b64 = inp.get("image_b64") or inp.get("image")
-        prompt = str(inp.get("prompt") or "cinematic, ultra realistic, high quality").strip()
-
-        # ✅ PATCH: acepta negative_prompt además de negative
-        negative = str(inp.get("negative_prompt") or inp.get("negative") or "").strip()
-
-        # ✅ PATCH: duración/fps/frames (3s o 5s)
-        duration_s, fps, num_frames = _normalize_timing(inp)
-
-        steps = int(inp.get("steps") or inp.get("num_inference_steps") or 14)
-        guidance = float(inp.get("guidance") or inp.get("guidance_scale") or 4.0)
-
-        # ✅ PATCH: aspect/platform -> dims si no vienen width/height
-        aspect_ratio = str(inp.get("aspect_ratio") or "").strip()
-        platform_ref = str(inp.get("platform_ref") or "").strip()
-        width, height = _pick_dims(inp.get("width"), inp.get("height"), aspect_ratio, platform_ref)
-
-        seed = inp.get("seed", None)
-
-        if not image_b64:
-            return {"ok": False, "ping": ping, "error": "missing image_b64", "gpu_info": _gpu_info(), **_diffusers_info()}
-
-        try:
-            pipe = _load_i2v(unload_other=True)
-            init_image = _b64_to_pil_image(str(image_b64))
-
-            generator = None
-            if seed is not None and str(seed) != "":
-                seed = int(seed)
-                generator = torch.Generator(device="cuda").manual_seed(seed) if DEVICE == "cuda" else torch.Generator().manual_seed(seed)
-
-            t0 = time.time()
-            result = pipe(
-                prompt=prompt,
-                negative_prompt=negative if negative else None,
-                image=init_image,
-                num_inference_steps=steps,
-                guidance_scale=guidance,
-                num_frames=num_frames,
-                height=height,
-                width=width,
-                generator=generator,
-            )
-
-            frames = _extract_frames(result)
-
-            try:
-                mp4_bytes = _frames_to_mp4_bytes(frames, fps=fps)
-            except Exception as enc_e:
-                raise RuntimeError(
-                    f"MP4_ENCODE_FAILED: {enc_e}. "
-                    "Tip: frames deben convertirse a HWC uint8 (ya lo hacemos) - si sigue fallando, dime shape del frame."
-                )
-
-            video_b64 = base64.b64encode(mp4_bytes).decode("utf-8")
-
-            return {
-                "ok": True,
-                "ping": ping,
-                "video_b64": video_b64,
-                "seconds": round(time.time() - t0, 3),
-                "gpu_info": _gpu_info(),
-                **_diffusers_info(),
-                "params": {
-                    "duration_s": duration_s,
-                    "frames": num_frames,
-                    "fps": fps,
-                    "steps": steps,
-                    "guidance": guidance,
-                    "height": height,
-                    "width": width,
-                    "seed": seed,
-                    "aspect_ratio": aspect_ratio,
-                    "platform_ref": platform_ref,
-                },
-                "note": "video_b64 es mp4 en base64. Súbelo a Supabase desde tu API (como Flux).",
-            }
-
-        except torch.cuda.OutOfMemoryError as e:
-            _hard_cleanup()
-            return {"ok": False, "ping": ping, "error": f"CUDA OOM: {str(e)}", "gpu_info": _gpu_info(), **_diffusers_info()}
-        except Exception as e:
-            _hard_cleanup()
-            return {"ok": False, "ping": ping, "error": str(e), "gpu_info": _gpu_info(), **_diffusers_info()}
-
-    # ---- T2V generate ----
-    if ping in ("t2v_generate", "wan_t2v_generate"):
-        prompt = str(inp.get("prompt") or "").strip()
-
-        # ✅ PATCH: acepta negative_prompt además de negative
-        negative = str(inp.get("negative_prompt") or inp.get("negative") or "").strip()
-
-        if not prompt:
-            return {"ok": False, "ping": ping, "error": "missing prompt", "gpu_info": _gpu_info(), **_diffusers_info()}
-
-        # ✅ PATCH: duración/fps/frames (3s o 5s)
-        duration_s, fps, num_frames = _normalize_timing(inp)
-
-        steps = int(inp.get("steps") or inp.get("num_inference_steps") or 14)
-        guidance = float(inp.get("guidance") or inp.get("guidance_scale") or 4.0)
-
-        # ✅ PATCH: aspect/platform -> dims si no vienen width/height
-        aspect_ratio = str(inp.get("aspect_ratio") or "").strip()
-        platform_ref = str(inp.get("platform_ref") or "").strip()
-        width, height = _pick_dims(inp.get("width"), inp.get("height"), aspect_ratio, platform_ref)
-
-        seed = inp.get("seed", None)
-
-        try:
-            pipe = _load_t2v(unload_other=True)
-
-            generator = None
-            if seed is not None and str(seed) != "":
-                seed = int(seed)
-                generator = torch.Generator(device="cuda").manual_seed(seed) if DEVICE == "cuda" else torch.Generator().manual_seed(seed)
-
-            t0 = time.time()
-            result = pipe(
-                prompt=prompt,
-                negative_prompt=negative if negative else None,
-                num_inference_steps=steps,
-                guidance_scale=guidance,
-                num_frames=num_frames,
-                height=height,
-                width=width,
-                generator=generator,
-            )
-
-            frames = _extract_frames(result)
-            mp4_bytes = _frames_to_mp4_bytes(frames, fps=fps)
-            video_b64 = base64.b64encode(mp4_bytes).decode("utf-8")
-
-            return {
-                "ok": True,
-                "ping": ping,
-                "video_b64": video_b64,
-                "seconds": round(time.time() - t0, 3),
-                "gpu_info": _gpu_info(),
-                **_diffusers_info(),
-                "params": {
-                    "duration_s": duration_s,
-                    "frames": num_frames,
-                    "fps": fps,
-                    "steps": steps,
-                    "guidance": guidance,
-                    "height": height,
-                    "width": width,
-                    "seed": seed,
-                    "aspect_ratio": aspect_ratio,
-                    "platform_ref": platform_ref,
-                },
-                "note": "video_b64 es mp4 en base64. Súbelo a Supabase desde tu API (como Flux).",
-            }
-
-        except torch.cuda.OutOfMemoryError as e:
-            _hard_cleanup()
-            return {"ok": False, "ping": ping, "error": f"CUDA OOM: {str(e)}", "gpu_info": _gpu_info(), **_diffusers_info()}
-        except Exception as e:
-            _hard_cleanup()
-            return {"ok": False, "ping": ping, "error": str(e), "gpu_info": _gpu_info(), **_diffusers_info()}
-
-    # Default
-    return {
-        "ok": True,
-        "msg": "DEFAULT_ECHO",
-        "input": inp,
-        "resolved_paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
-        "gpu_info": _gpu_info(),
-        **_diffusers_info(),
-    }
+    except Exception as e:
+        # Important: liberar VRAM si algo truena
+        _hard_cleanup()
+        return {
+            "ok": False,
+            "error": str(e),
+            "gpu_info": _gpu_info(),
+            **_diffusers_info(),
+        }
+    finally:
+        # cleanup suave post-job (opcional)
+        _cuda_cleanup()
 
 runpod.serverless.start({"handler": handler})
