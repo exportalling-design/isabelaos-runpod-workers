@@ -366,6 +366,82 @@ def _extract_frames(result):
     raise RuntimeError(f"Could not extract frames from result type={type(result)}")
 
 # ---------------------------
+# PATCH: timing + aspect/platform helpers (3s/5s, formats)
+# ---------------------------
+def _clamp_int(v, lo: int, hi: int, default: int) -> int:
+    try:
+        n = int(round(float(v)))
+    except Exception:
+        return default
+    return max(lo, min(hi, n))
+
+def _pick_dims(width, height, aspect_ratio: str = "", platform_ref: str = "") -> Tuple[int, int]:
+    # 1) Si vienen width/height válidos, respétalos
+    try:
+        w = int(width) if width is not None else None
+        h = int(height) if height is not None else None
+        if w and h and w > 0 and h > 0:
+            return w, h
+    except Exception:
+        pass
+
+    ar = (aspect_ratio or "").strip()
+
+    # 2) aspect_ratio explícito
+    if ar == "9:16":
+        return 1080, 1920
+    if ar == "1:1":
+        return 1080, 1080
+    if ar == "16:9":
+        return 1920, 1080
+    if ar == "4:5":
+        return 1080, 1350
+    if ar == "4:3":
+        return 1440, 1080
+
+    # 3) platform_ref
+    p = (platform_ref or "").lower().strip()
+    if p == "tiktok":
+        return 1080, 1920
+    if p == "instagram":
+        return 1080, 1920
+    if p == "youtube":
+        return 1920, 1080
+    if p == "facebook":
+        return 1440, 1080
+
+    # 4) fallback
+    return 768, 432
+
+def _normalize_timing(inp: Dict[str, Any]) -> Tuple[int, int, int]:
+    """
+    Devuelve (seconds, fps, num_frames)
+    Regla: SOLO 3s o 5s por ahora.
+    Acepta: duration_s | seconds, fps, frames | num_frames
+    """
+    seconds_raw = inp.get("duration_s", None)
+    if seconds_raw is None:
+        seconds_raw = inp.get("seconds", None)
+    if seconds_raw is None:
+        seconds_raw = 4
+
+    # clamp 3..5 y luego forzamos solo 3 o 5
+    seconds = _clamp_int(seconds_raw, 3, 5, 3)
+    seconds = 3 if seconds < 4 else 5
+
+    fps = _clamp_int(inp.get("fps", 24), 8, 60, 24)
+
+    nf_raw = inp.get("num_frames", None)
+    if nf_raw is None:
+        nf_raw = inp.get("frames", None)
+    if nf_raw is None:
+        nf_raw = seconds * fps
+
+    num_frames = _clamp_int(nf_raw, 1, 9999, seconds * fps)
+
+    return seconds, fps, num_frames
+
+# ---------------------------
 # Pipelines
 # ---------------------------
 def _unload_pipes(keep: Optional[str] = None):
@@ -505,6 +581,17 @@ def _walk_find_model_index(root: str, max_depth: int = 4, limit: int = 50) -> Li
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     inp = job.get("input") or {}
     ping = str(inp.get("ping") or "").strip().lower()
+
+    # ---------------------------------------------------------
+    # ✅ PATCH: compatibilidad con API que manda "mode"
+    # Si viene mode=t2v o mode=i2v, lo convertimos a ping interno.
+    # ---------------------------------------------------------
+    mode = str(inp.get("mode") or "").strip().lower()
+    if not ping and mode:
+        if mode == "t2v":
+            ping = "t2v_generate"
+        elif mode == "i2v":
+            ping = "i2v_generate"
 
     # ---- debug ----
     if ping in ("echo", "debug"):
@@ -647,14 +734,21 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     if ping in ("i2v_generate", "wan_i2v_generate"):
         image_b64 = inp.get("image_b64") or inp.get("image")
         prompt = str(inp.get("prompt") or "cinematic, ultra realistic, high quality").strip()
-        negative = str(inp.get("negative") or "").strip()
 
-        num_frames = int(inp.get("frames") or inp.get("num_frames") or 16)
-        fps = int(inp.get("fps") or 24)
+        # ✅ PATCH: acepta negative_prompt además de negative
+        negative = str(inp.get("negative_prompt") or inp.get("negative") or "").strip()
+
+        # ✅ PATCH: duración/fps/frames (3s o 5s)
+        duration_s, fps, num_frames = _normalize_timing(inp)
+
         steps = int(inp.get("steps") or inp.get("num_inference_steps") or 14)
         guidance = float(inp.get("guidance") or inp.get("guidance_scale") or 4.0)
-        height = int(inp.get("height") or 512)
-        width = int(inp.get("width") or 512)
+
+        # ✅ PATCH: aspect/platform -> dims si no vienen width/height
+        aspect_ratio = str(inp.get("aspect_ratio") or "").strip()
+        platform_ref = str(inp.get("platform_ref") or "").strip()
+        width, height = _pick_dims(inp.get("width"), inp.get("height"), aspect_ratio, platform_ref)
+
         seed = inp.get("seed", None)
 
         if not image_b64:
@@ -702,6 +796,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 "gpu_info": _gpu_info(),
                 **_diffusers_info(),
                 "params": {
+                    "duration_s": duration_s,
                     "frames": num_frames,
                     "fps": fps,
                     "steps": steps,
@@ -709,6 +804,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     "height": height,
                     "width": width,
                     "seed": seed,
+                    "aspect_ratio": aspect_ratio,
+                    "platform_ref": platform_ref,
                 },
                 "note": "video_b64 es mp4 en base64. Súbelo a Supabase desde tu API (como Flux).",
             }
@@ -723,16 +820,24 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     # ---- T2V generate ----
     if ping in ("t2v_generate", "wan_t2v_generate"):
         prompt = str(inp.get("prompt") or "").strip()
-        negative = str(inp.get("negative") or "").strip()
+
+        # ✅ PATCH: acepta negative_prompt además de negative
+        negative = str(inp.get("negative_prompt") or inp.get("negative") or "").strip()
+
         if not prompt:
             return {"ok": False, "ping": ping, "error": "missing prompt", "gpu_info": _gpu_info(), **_diffusers_info()}
 
-        num_frames = int(inp.get("frames") or inp.get("num_frames") or 16)
-        fps = int(inp.get("fps") or 24)
+        # ✅ PATCH: duración/fps/frames (3s o 5s)
+        duration_s, fps, num_frames = _normalize_timing(inp)
+
         steps = int(inp.get("steps") or inp.get("num_inference_steps") or 14)
         guidance = float(inp.get("guidance") or inp.get("guidance_scale") or 4.0)
-        height = int(inp.get("height") or 512)
-        width = int(inp.get("width") or 512)
+
+        # ✅ PATCH: aspect/platform -> dims si no vienen width/height
+        aspect_ratio = str(inp.get("aspect_ratio") or "").strip()
+        platform_ref = str(inp.get("platform_ref") or "").strip()
+        width, height = _pick_dims(inp.get("width"), inp.get("height"), aspect_ratio, platform_ref)
+
         seed = inp.get("seed", None)
 
         try:
@@ -767,6 +872,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 "gpu_info": _gpu_info(),
                 **_diffusers_info(),
                 "params": {
+                    "duration_s": duration_s,
                     "frames": num_frames,
                     "fps": fps,
                     "steps": steps,
@@ -774,6 +880,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     "height": height,
                     "width": width,
                     "seed": seed,
+                    "aspect_ratio": aspect_ratio,
+                    "platform_ref": platform_ref,
                 },
                 "note": "video_b64 es mp4 en base64. Súbelo a Supabase desde tu API (como Flux).",
             }
