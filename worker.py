@@ -1,5 +1,7 @@
 # worker.py (RunPod Serverless) — IsabelaOS Video Worker (WAN)
 # ✅ MISMO worker que tenías, solo con PATCH de limpieza + firma + frames WAN
+# ✅ FIX CRÍTICO: quitar expandable_segments (causa INTERNAL ASSERT FAILED)
+
 import os
 import time
 import gc
@@ -13,11 +15,9 @@ from typing import Any, Dict, Optional, Tuple
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# (opcional pero recomendado en serverless para fragmentación)
-os.environ.setdefault(
-    "PYTORCH_CUDA_ALLOC_CONF",
-    "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.8"
-)
+# ✅ FIX CRÍTICO (SERVERLESS): NO usar expandable_segments (rompe torch en warm state)
+# Antes: "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.8"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256,garbage_collection_threshold:0.8"
 
 # --- hf cached_download compatibility ---
 import huggingface_hub as h
@@ -673,51 +673,35 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 "env": {
                     "WAN_T2V_PATH": os.environ.get("WAN_T2V_PATH"),
                     "WAN_I2V_PATH": os.environ.get("WAN_I2V_PATH"),
+                    "PYTORCH_CUDA_ALLOC_CONF": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
                 },
                 "resolved_paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
                 "sizes": {
                     "default": {"w": DEFAULT_W, "h": DEFAULT_H},
                     "reels_9_16": {"w": REELS_W, "h": REELS_H},
                 },
-                "notes": "PATCH: frames WAN + signature reload + cleanup real",
+                "notes": "PATCH: frames WAN + signature reload + cleanup real + FIX allocator(no expandable_segments)",
             }
 
         if ping == "smoke":
             return {"ok": True, "msg": "SMOKE_OK", "gpu_info": _gpu_info(), **_diffusers_info()}
 
-        if ping == "gpu_sanity":
-            return {"ok": True, **_gpu_info(), **_diffusers_info()}
-
-        if ping == "list_paths":
-            candidates = [
-                "/",
-                "/workspace",
-                "/workspace/models",
-                "/workspace/models/wan22",
-                "/runpod-volume",
-                "/runpod-volume/models",
-                "/runpod-volume/models/wan22",
-                MODEL_T2V_LOCAL,
-                MODEL_I2V_LOCAL,
-            ]
-            return {
-                "ok": True,
-                "candidates": {p: _list_dir_safe(p, limit=120) for p in candidates},
-                "resolved_paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
-                **_diffusers_info(),
-                "gpu_info": _gpu_info(),
-            }
-
+        # ✅ Ejecutores
         if ping == "t2v_generate":
             return _t2v_generate(inp)
 
         if ping == "i2v_generate":
             return _i2v_generate(inp)
 
-        return {"ok": False, "error": "Ping/Modo inválido", "gpu_info": _gpu_info(), **_diffusers_info()}
+        # fallback: si no mandan ping correcto
+        return {
+            "ok": False,
+            "error": f"Unknown ping/mode: ping='{ping}' mode='{mode}'",
+            "gpu_info": _gpu_info(),
+            **_diffusers_info(),
+        }
 
     except Exception as e:
-        _hard_cleanup()
         return {
             "ok": False,
             "error": str(e),
@@ -726,4 +710,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             **_diffusers_info(),
         }
 
+# ---------------------------
+# RunPod Serverless start
+# ---------------------------
 runpod.serverless.start({"handler": handler})
