@@ -1,10 +1,10 @@
-# worker.py — IsabelaOS Video Worker (WAN 2.2) — SERVERLESS SAFE
+# worker.py — IsabelaOS Video Worker (WAN 2.2) [SERVERLESS FINAL]
 # ============================================================
-# FIXES:
-# ✅ RMSNorm patch compatible con elementwise_affine
-# ✅ Anti-fragmentación VRAM
-# ✅ NO REUSAR PIPE ENTRE JOBS (evita mismatch 16720 vs 17480 y OOM sucio)
-# ✅ Defaults = POD: 576x1024, 24fps, 72 frames, steps 25, cfg 7.5
+# OBJETIVO:
+# - MISMO resultado "POD" (WAN 2.2)
+# - SIN errores aleatorios (OOM / mismatch frames)
+# - Limpieza REAL de VRAM entre requests
+# - NO inventa parámetros raros
 # ============================================================
 
 import os
@@ -22,51 +22,42 @@ from typing import Any, Dict, Optional, Tuple
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# 🔥 CRÍTICO: reduce fragmentación en serverless
 os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF",
-    "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.8",
+    "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.8"
 )
 
 # ------------------------------------------------------------
-# HF cached_download compatibility
+# HF cached_download compatibility (huggingface_hub)
 # ------------------------------------------------------------
 import huggingface_hub as h
-
 if not hasattr(h, "cached_download"):
     from huggingface_hub import hf_hub_download as _hf_hub_download
-
     def _cached_download(*args, **kwargs):
         return _hf_hub_download(*args, **kwargs)
-
     h.cached_download = _cached_download
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ------------------------------------------------------------
-# RMSNorm fallback (WAN pasa elementwise_affine=True)
-# ------------------------------------------------------------
-import inspect
-
-
-def _needs_rmsnorm_patch() -> bool:
-    if not hasattr(nn, "RMSNorm"):
-        return True
+# Buenas prácticas (no rompe nada)
+if torch.cuda.is_available():
     try:
-        sig = inspect.signature(nn.RMSNorm.__init__)
-        return "elementwise_affine" not in sig.parameters
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     except Exception:
-        return True
+        pass
 
-
-if _needs_rmsnorm_patch():
-
+# ------------------------------------------------------------
+# RMSNorm fallback (COMPAT con elementwise_affine)
+# ------------------------------------------------------------
+if not hasattr(nn, "RMSNorm"):
     class RMSNorm(nn.Module):
-        def __init__(self, dim, eps=1e-6, elementwise_affine=True, **kwargs):
+        def __init__(self, dim, eps=1e-6, elementwise_affine=True):
             super().__init__()
             self.eps = eps
-            self.dim = dim
             if elementwise_affine:
                 self.weight = nn.Parameter(torch.ones(dim))
             else:
@@ -74,30 +65,28 @@ if _needs_rmsnorm_patch():
 
         def forward(self, x):
             var = x.pow(2).mean(-1, keepdim=True)
-            x = x * torch.rsqrt(var + self.eps)
-            if self.weight is not None:
-                x = x * self.weight
-            return x
+            x_norm = x / torch.sqrt(var + self.eps)
+            if getattr(self, "weight", None) is not None:
+                x_norm = x_norm * self.weight
+            return x_norm
 
     nn.RMSNorm = RMSNorm
 
 # ------------------------------------------------------------
-# scaled_dot_product_attention patch (remove enable_gqa kwarg)
+# scaled_dot_product_attention patch (enable_gqa)
 # ------------------------------------------------------------
 if hasattr(F, "scaled_dot_product_attention"):
     _orig_sdp = F.scaled_dot_product_attention
-
     def patched_sdp_attention(*args, **kwargs):
         kwargs.pop("enable_gqa", None)
         return _orig_sdp(*args, **kwargs)
-
     F.scaled_dot_product_attention = patched_sdp_attention
 
 import runpod
 
-# ---------------------------
+# ------------------------------------------------------------
 # Paths / Config
-# ---------------------------
+# ------------------------------------------------------------
 def _normalize_model_path(p: str) -> str:
     if not p:
         return p
@@ -110,7 +99,6 @@ def _normalize_model_path(p: str) -> str:
         p = p.replace("//", "/")
     return p
 
-
 DEFAULT_T2V_PATH = "/runpod-volume/models/wan22/ti2v-5b"
 DEFAULT_I2V_PATH = "/runpod-volume/models/wan22/i2v-a14b"
 
@@ -118,12 +106,14 @@ MODEL_T2V_LOCAL = _normalize_model_path(os.environ.get("WAN_T2V_PATH", DEFAULT_T
 MODEL_I2V_LOCAL = _normalize_model_path(os.environ.get("WAN_I2V_PATH", DEFAULT_I2V_PATH))
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
+DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32  # WAN estable en fp16
 
+_pipe_t2v = None
+_pipe_i2v = None
 
-# ---------------------------
-# Cleanup helpers (VRAM REAL)
-# ---------------------------
+# ------------------------------------------------------------
+# VRAM CLEANUP REAL
+# ------------------------------------------------------------
 def _cuda_cleanup(sync=True):
     if not torch.cuda.is_available():
         return
@@ -140,19 +130,40 @@ def _cuda_cleanup(sync=True):
         torch.cuda.ipc_collect()
     except Exception:
         pass
-    try:
-        torch.cuda.reset_peak_memory_stats()
-    except Exception:
-        pass
 
-
-def _hard_cleanup():
+def _hard_cleanup(sync=True):
     try:
         gc.collect()
     except Exception:
         pass
-    _cuda_cleanup(sync=True)
+    _cuda_cleanup(sync=sync)
 
+def _safe_pipe_to_cpu(pipe):
+    try:
+        pipe.to("cpu")
+    except Exception:
+        pass
+
+def _unload_pipes(keep: Optional[str] = None):
+    global _pipe_t2v, _pipe_i2v
+
+    if keep != "t2v" and _pipe_t2v is not None:
+        _safe_pipe_to_cpu(_pipe_t2v)
+        try:
+            del _pipe_t2v
+        except Exception:
+            pass
+        _pipe_t2v = None
+
+    if keep != "i2v" and _pipe_i2v is not None:
+        _safe_pipe_to_cpu(_pipe_i2v)
+        try:
+            del _pipe_i2v
+        except Exception:
+            pass
+        _pipe_i2v = None
+
+    _hard_cleanup(sync=True)
 
 def _gpu_info():
     info = {
@@ -170,30 +181,19 @@ def _gpu_info():
             pass
     return info
 
-
 def _diffusers_info():
     try:
         import diffusers
-
         return {"diffusers_version": getattr(diffusers, "__version__", "unknown")}
     except Exception as e:
         return {"diffusers_version": None, "diffusers_import_error": str(e)}
-
 
 def _assert_model_dir(path: str, label: str):
     if not os.path.isdir(path):
         raise RuntimeError(f"{label} model path not found: {path}")
 
-
-def _lazy_import_wan():
-    # Import aquí para que el RMSNorm patch ya exista
-    from diffusers import WanPipeline, WanImageToVideoPipeline, AutoencoderKLWan
-
-    return WanPipeline, WanImageToVideoPipeline, AutoencoderKLWan
-
-
 def _pipe_memory_tweaks(pipe):
-    # reduce VRAM, no cambia “calidad artística”
+    # Ajustes seguros (no cambian “look”, solo ayudan memoria)
     try:
         pipe.enable_attention_slicing("max")
     except Exception:
@@ -208,57 +208,54 @@ def _pipe_memory_tweaks(pipe):
         pass
     return pipe
 
+def _lazy_import_wan():
+    # Importa solo cuando se necesita (más rápido en cold start)
+    from diffusers import WanPipeline, WanImageToVideoPipeline, AutoencoderKLWan
+    return WanPipeline, WanImageToVideoPipeline, AutoencoderKLWan
 
-# ---------------------------
-# Base64 image decode (robusto)
-# ---------------------------
+# ------------------------------------------------------------
+# Robust base64 decode
+# ------------------------------------------------------------
 def _decode_b64(s: str) -> bytes:
     if not s:
         raise ValueError("image_b64 vacío")
-
     s = str(s).strip()
-
     if s.lower().startswith("data:") and "," in s:
         s = s.split(",", 1)[1].strip()
-
     s = s.replace("-", "+").replace("_", "/")
-
     pad = (-len(s)) % 4
     if pad:
         s += "=" * pad
-
     try:
         return base64.b64decode(s, validate=True)
     except (binascii.Error, ValueError) as e:
         raise ValueError(f"image_b64 inválido: {e}")
 
-
 def _b64_to_pil_image(image_b64: str):
     from PIL import Image
-
     raw = _decode_b64(image_b64)
     img = Image.open(BytesIO(raw))
     img.load()
     return img.convert("RGB")
 
-
-# ---------------------------
+# ------------------------------------------------------------
 # Frames -> MP4 bytes
-# ---------------------------
+# ------------------------------------------------------------
 def _to_uint8_hwc(frame):
     import numpy as np
-
-    if hasattr(frame, "convert"):
-        return np.array(frame.convert("RGB"), dtype=np.uint8)
-
+    if hasattr(frame, "convert"):  # PIL
+        arr = np.array(frame.convert("RGB"), dtype=np.uint8)
+        return arr
     if torch.is_tensor(frame):
-        arr = frame.detach().float().cpu().numpy()
+        t = frame.detach().float().cpu().numpy()
+        arr = t
     else:
         arr = np.asarray(frame)
 
     while arr.ndim >= 4 and arr.shape[0] == 1:
         arr = arr[0]
 
+    # (C,H,W)->(H,W,C)
     if arr.ndim == 3:
         c_first = arr.shape[0] in (1, 3, 4)
         c_last_ok = arr.shape[-1] in (1, 3, 4)
@@ -273,13 +270,10 @@ def _to_uint8_hwc(frame):
 
     return arr
 
-
 def _normalize_frames(frames):
     import numpy as np
-
     if torch.is_tensor(frames):
         frames = frames.detach().cpu().numpy()
-
     if isinstance(frames, np.ndarray):
         while frames.ndim >= 5 and frames.shape[0] == 1:
             frames = frames[0]
@@ -288,11 +282,9 @@ def _normalize_frames(frames):
 
     return [_to_uint8_hwc(f) for f in frames]
 
-
 def _frames_to_mp4_bytes(frames, fps: int = 24) -> bytes:
     import imageio.v2 as imageio
     import tempfile
-
     frames_u8 = _normalize_frames(frames)
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=True) as tmp:
@@ -302,10 +294,8 @@ def _frames_to_mp4_bytes(frames, fps: int = 24) -> bytes:
                 writer.append_data(arr)
         finally:
             writer.close()
-
         tmp.seek(0)
         return tmp.read()
-
 
 def _extract_frames(result):
     if isinstance(result, dict):
@@ -315,23 +305,21 @@ def _extract_frames(result):
                 if isinstance(v, list) and len(v) == 1 and isinstance(v[0], list):
                     return v[0]
                 return v
-
     for k in ("frames", "videos", "video"):
         if hasattr(result, k):
             v = getattr(result, k)
             if isinstance(v, list) and len(v) == 1 and isinstance(v[0], list):
                 return v[0]
             return v
-
     try:
         return result[0]
     except Exception:
-        raise RuntimeError(f"Could not extract frames from result type={type(result)}")
+        pass
+    raise RuntimeError(f"Could not extract frames from result type={type(result)}")
 
-
-# ---------------------------
-# Timing + Dims (MISMO POD)
-# ---------------------------
+# ------------------------------------------------------------
+# Timing + Dims (POD-like)
+# ------------------------------------------------------------
 def _clamp_int(v, lo: int, hi: int, default: int) -> int:
     try:
         n = int(round(float(v)))
@@ -339,52 +327,69 @@ def _clamp_int(v, lo: int, hi: int, default: int) -> int:
         return default
     return max(lo, min(hi, n))
 
-
 def _snap16(n: int) -> int:
-    r = int(round(int(n) / 16.0) * 16)
+    n = int(n)
+    r = int(round(n / 16.0) * 16)
     return max(16, r)
 
+def _fix_frames_for_wan(n: int) -> int:
+    """
+    WAN: (num_frames - 1) MUST be divisible by 4.
+    Evitamos que diffusers "redondee" adentro (eso causó tu mismatch).
+    """
+    n = int(n)
+    if n < 5:
+        return 5
+    return int(1 + 4 * round((n - 1) / 4))
 
-# POD defaults
-POD_W, POD_H = 576, 1024
-POD_FPS = 24
-POD_SECONDS = 3
-POD_FRAMES = 72
-POD_STEPS = 25
-POD_CFG = 7.5
+# ✅ POD default landscape
+POD_W, POD_H = 1280, 720
 
+# ✅ Reels 9:16 (rápido)
+REELS_W, REELS_H = 576, 1024
 
 def _pick_dims(inp: Dict[str, Any]) -> Tuple[int, int]:
-    w = inp.get("width", None)
-    h = inp.get("height", None)
-    if w is not None and h is not None:
-        return _snap16(int(w)), _snap16(int(h))
-    return _snap16(POD_W), _snap16(POD_H)
-
+    ar = str(inp.get("aspect_ratio") or "").strip()
+    if ar == "9:16":
+        return REELS_W, REELS_H
+    # default = POD-like
+    return POD_W, POD_H
 
 def _normalize_timing(inp: Dict[str, Any]) -> Tuple[int, int, int]:
-    fps = _clamp_int(inp.get("fps", POD_FPS), 8, 30, POD_FPS)
+    fps = _clamp_int(inp.get("fps", 24), 8, 30, 24)
 
-    if inp.get("num_frames") is not None:
-        num_frames = _clamp_int(inp.get("num_frames", POD_FRAMES), 1, 300, POD_FRAMES)
-        seconds = max(1, int(round(num_frames / max(1, fps))))
-        return seconds, fps, num_frames
+    seconds_raw = inp.get("duration_s", inp.get("seconds", 3))
+    seconds = _clamp_int(seconds_raw, 1, 10, 3)
 
-    seconds = _clamp_int(inp.get("duration_s", inp.get("seconds", POD_SECONDS)), 1, 10, POD_SECONDS)
-    num_frames = int(round(seconds * fps))
-    return seconds, fps, num_frames
+    # si mandan num_frames, lo respetamos (POD behavior), pero lo arreglamos a WAN-format
+    raw_frames = inp.get("num_frames", inp.get("frames", seconds * fps))
+    try:
+        raw_frames = int(raw_frames)
+    except Exception:
+        raw_frames = int(seconds * fps)
 
+    num_frames = _fix_frames_for_wan(raw_frames)
+    return int(seconds), int(fps), int(num_frames)
 
-# ---------------------------
-# LOAD PIPE PER JOB (NO CACHE)
-# ---------------------------
-def _load_t2v_fresh():
+# ------------------------------------------------------------
+# Load pipelines (con cleanup real)
+# ------------------------------------------------------------
+def _load_t2v(unload_other=True):
+    global _pipe_t2v
+    if _pipe_t2v is not None:
+        return _pipe_t2v
+
+    if unload_other:
+        _unload_pipes(keep="t2v")
+
     _assert_model_dir(MODEL_T2V_LOCAL, "T2V")
     WanPipeline, _, AutoencoderKLWan = _lazy_import_wan()
 
-    print(f"[WAN_LOAD] T2V path: {MODEL_T2V_LOCAL}")
+    t0 = time.time()
+    print(f"[WAN_LOAD] Loading T2V LOCAL from: {MODEL_T2V_LOCAL}")
     print(f"[WAN_LOAD] dtype={DTYPE} device={DEVICE}")
 
+    # VAE float32 estable, resto fp16
     vae = AutoencoderKLWan.from_pretrained(
         MODEL_T2V_LOCAL,
         subfolder="vae",
@@ -401,19 +406,32 @@ def _load_t2v_fresh():
         low_cpu_mem_usage=True,
     )
 
-    pipe = _pipe_memory_tweaks(pipe)
-
     if DEVICE == "cuda":
-        pipe = pipe.to("cuda")
+        try:
+            pipe = pipe.to("cuda")
+        except torch.cuda.OutOfMemoryError:
+            print("[WAN_LOAD] OOM on pipe.to(cuda) -> hard cleanup and retry")
+            _hard_cleanup(sync=True)
+            pipe = pipe.to("cuda")
 
-    return pipe
+    pipe = _pipe_memory_tweaks(pipe)
+    _pipe_t2v = pipe
+    print(f"[WAN_LOAD] T2V loaded OK in {time.time() - t0:.2f}s")
+    return _pipe_t2v
 
+def _load_i2v(unload_other=True):
+    global _pipe_i2v
+    if _pipe_i2v is not None:
+        return _pipe_i2v
 
-def _load_i2v_fresh():
+    if unload_other:
+        _unload_pipes(keep="i2v")
+
     _assert_model_dir(MODEL_I2V_LOCAL, "I2V")
     _, WanImageToVideoPipeline, AutoencoderKLWan = _lazy_import_wan()
 
-    print(f"[WAN_LOAD] I2V path: {MODEL_I2V_LOCAL}")
+    t0 = time.time()
+    print(f"[WAN_LOAD] Loading I2V LOCAL from: {MODEL_I2V_LOCAL}")
     print(f"[WAN_LOAD] dtype={DTYPE} device={DEVICE}")
 
     vae = AutoencoderKLWan.from_pretrained(
@@ -432,167 +450,174 @@ def _load_i2v_fresh():
         low_cpu_mem_usage=True,
     )
 
-    pipe = _pipe_memory_tweaks(pipe)
-
     if DEVICE == "cuda":
-        pipe = pipe.to("cuda")
+        try:
+            pipe = pipe.to("cuda")
+        except torch.cuda.OutOfMemoryError:
+            print("[WAN_LOAD] OOM on pipe.to(cuda) -> hard cleanup and retry")
+            _hard_cleanup(sync=True)
+            pipe = pipe.to("cuda")
 
-    return pipe
+    pipe = _pipe_memory_tweaks(pipe)
+    _pipe_i2v = pipe
+    print(f"[WAN_LOAD] I2V loaded OK in {time.time() - t0:.2f}s")
+    return _pipe_i2v
 
-
-def _destroy_pipe(pipe):
-    try:
-        pipe.to("cpu")
-    except Exception:
-        pass
-    try:
-        del pipe
-    except Exception:
-        pass
-    _hard_cleanup()
-
-
-# ---------------------------
+# ------------------------------------------------------------
 # Generators
-# ---------------------------
+# ------------------------------------------------------------
 def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
-    pipe = None
-    try:
-        # Limpieza antes de cargar (serverless warm)
-        _hard_cleanup()
+    pipe = _load_t2v(unload_other=True)
 
-        pipe = _load_t2v_fresh()
+    prompt = str(inp.get("prompt") or "").strip()
+    if not prompt:
+        raise RuntimeError("Falta prompt")
 
-        prompt = str(inp.get("prompt") or "").strip()
-        if not prompt:
-            raise RuntimeError("Falta prompt")
+    negative = str(inp.get("negative_prompt") or "").strip()
+    negative = negative if negative else None
 
-        negative = str(inp.get("negative_prompt") or "").strip() or None
+    seconds, fps, num_frames = _normalize_timing(inp)
+    w_raw, h_raw = _pick_dims(inp)
+    width, height = _snap16(w_raw), _snap16(h_raw)
 
-        seconds, fps, num_frames = _normalize_timing(inp)
-        width, height = _pick_dims(inp)
+    # Respetar valores POD si vienen:
+    steps = _clamp_int(inp.get("steps", 34), 1, 80, 34)
+    guidance_scale = float(inp.get("guidance_scale", 6.5) or 6.5)
 
-        steps = _clamp_int(inp.get("steps", POD_STEPS), 1, 80, POD_STEPS)
-        guidance_scale = float(inp.get("guidance_scale", POD_CFG) or POD_CFG)
+    print(f"[T2V] w={width} h={height} fps={fps} frames={num_frames} steps={steps} cfg={guidance_scale}")
 
-        t0 = time.time()
-        print(f"[T2V] w={width} h={height} fps={fps} frames={num_frames} steps={steps} cfg={guidance_scale}")
+    t0 = time.time()
+    with torch.inference_mode():
+        result = pipe(
+            prompt=prompt,
+            negative_prompt=negative,
+            width=width,
+            height=height,
+            num_frames=num_frames,              # ✅ YA arreglado al formato WAN
+            num_inference_steps=steps,
+            guidance_scale=guidance_scale,
+        )
 
-        with torch.inference_mode():
-            result = pipe(
-                prompt=prompt,
-                negative_prompt=negative,
-                width=width,
-                height=height,
-                num_frames=num_frames,
-                num_inference_steps=steps,
-                guidance_scale=guidance_scale,
-            )
+    frames = _extract_frames(result)
+    mp4_bytes = _frames_to_mp4_bytes(frames, fps=fps)
+    mp4_b64 = base64.b64encode(mp4_bytes).decode("utf-8")
 
-        frames = _extract_frames(result)
-        mp4_bytes = _frames_to_mp4_bytes(frames, fps=fps)
-        mp4_b64 = base64.b64encode(mp4_bytes).decode("utf-8")
+    # Limpieza ligera entre jobs (sin matar pipeline)
+    _cuda_cleanup(sync=False)
 
-        return {
-            "ok": True,
-            "mode": "t2v",
-            "width": width,
-            "height": height,
-            "seconds": seconds,
-            "fps": fps,
-            "num_frames": num_frames,
-            "steps": steps,
-            "guidance_scale": guidance_scale,
-            "elapsed_s": round(time.time() - t0, 3),
-            "video_b64": mp4_b64,
-            "video_mime": "video/mp4",
-            "gpu_info": _gpu_info(),
-            **_diffusers_info(),
-        }
-    finally:
-        if pipe is not None:
-            _destroy_pipe(pipe)
-
+    return {
+        "ok": True,
+        "mode": "t2v",
+        "width": width,
+        "height": height,
+        "seconds": seconds,
+        "fps": fps,
+        "num_frames": num_frames,
+        "steps": steps,
+        "guidance_scale": guidance_scale,
+        "elapsed_s": round(time.time() - t0, 3),
+        "video_b64": mp4_b64,
+        "video_mime": "video/mp4",
+        **_diffusers_info(),
+        "gpu_info": _gpu_info(),
+    }
 
 def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
-    pipe = None
+    pipe = _load_i2v(unload_other=True)
+
+    prompt = str(inp.get("prompt") or "").strip()
+    if not prompt:
+        raise RuntimeError("Falta prompt")
+
+    image_b64 = inp.get("image_b64") or inp.get("image") or inp.get("init_image_b64")
+    if not image_b64:
+        raise RuntimeError("Falta image_b64")
+
+    init_img = _b64_to_pil_image(str(image_b64))
+    negative = str(inp.get("negative_prompt") or "").strip()
+    negative = negative if negative else None
+
+    seconds, fps, num_frames = _normalize_timing(inp)
+    w_raw, h_raw = _pick_dims(inp)
+    width, height = _snap16(w_raw), _snap16(h_raw)
+
+    # Resize init image al tamaño estable elegido
     try:
-        _hard_cleanup()
+        init_img = init_img.resize((width, height))
+    except Exception:
+        pass
 
-        pipe = _load_i2v_fresh()
+    steps = _clamp_int(inp.get("steps", 34), 1, 80, 34)
+    guidance_scale = float(inp.get("guidance_scale", 6.5) or 6.5)
 
-        prompt = str(inp.get("prompt") or "").strip()
-        if not prompt:
-            raise RuntimeError("Falta prompt")
+    print(f"[I2V] w={width} h={height} fps={fps} frames={num_frames} steps={steps} cfg={guidance_scale}")
 
-        image_b64 = inp.get("image_b64") or inp.get("image") or inp.get("init_image_b64")
-        if not image_b64:
-            raise RuntimeError("Falta image_b64")
+    t0 = time.time()
+    with torch.inference_mode():
+        result = pipe(
+            prompt=prompt,
+            image=init_img,
+            negative_prompt=negative,
+            width=width,
+            height=height,
+            num_frames=num_frames,              # ✅ YA arreglado al formato WAN
+            num_inference_steps=steps,
+            guidance_scale=guidance_scale,
+        )
 
-        init_img = _b64_to_pil_image(str(image_b64))
+    frames = _extract_frames(result)
+    mp4_bytes = _frames_to_mp4_bytes(frames, fps=fps)
+    mp4_b64 = base64.b64encode(mp4_bytes).decode("utf-8")
 
-        negative = str(inp.get("negative_prompt") or "").strip() or None
+    _cuda_cleanup(sync=False)
 
-        seconds, fps, num_frames = _normalize_timing(inp)
-        width, height = _pick_dims(inp)
+    return {
+        "ok": True,
+        "mode": "i2v",
+        "width": width,
+        "height": height,
+        "seconds": seconds,
+        "fps": fps,
+        "num_frames": num_frames,
+        "steps": steps,
+        "guidance_scale": guidance_scale,
+        "elapsed_s": round(time.time() - t0, 3),
+        "video_b64": mp4_b64,
+        "video_mime": "video/mp4",
+        **_diffusers_info(),
+        "gpu_info": _gpu_info(),
+    }
 
-        steps = _clamp_int(inp.get("steps", POD_STEPS), 1, 80, POD_STEPS)
-        guidance_scale = float(inp.get("guidance_scale", POD_CFG) or POD_CFG)
+# ------------------------------------------------------------
+# Debug helpers (no los quito)
+# ------------------------------------------------------------
+def _list_dir_safe(path: str, limit: int = 200):
+    try:
+        items = sorted(os.listdir(path))
+        if len(items) > limit:
+            return items[:limit] + [f"...(+{len(items)-limit} more)"]
+        return items
+    except Exception as e:
+        return [f"<cannot list: {e}>"]
 
-        try:
-            init_img = init_img.resize((width, height))
-        except Exception:
-            pass
-
-        t0 = time.time()
-        print(f"[I2V] w={width} h={height} fps={fps} frames={num_frames} steps={steps} cfg={guidance_scale}")
-
-        with torch.inference_mode():
-            result = pipe(
-                prompt=prompt,
-                image=init_img,
-                negative_prompt=negative,
-                width=width,
-                height=height,
-                num_frames=num_frames,
-                num_inference_steps=steps,
-                guidance_scale=guidance_scale,
-            )
-
-        frames = _extract_frames(result)
-        mp4_bytes = _frames_to_mp4_bytes(frames, fps=fps)
-        mp4_b64 = base64.b64encode(mp4_bytes).decode("utf-8")
-
-        return {
-            "ok": True,
-            "mode": "i2v",
-            "width": width,
-            "height": height,
-            "seconds": seconds,
-            "fps": fps,
-            "num_frames": num_frames,
-            "steps": steps,
-            "guidance_scale": guidance_scale,
-            "elapsed_s": round(time.time() - t0, 3),
-            "video_b64": mp4_b64,
-            "video_mime": "video/mp4",
-            "gpu_info": _gpu_info(),
-            **_diffusers_info(),
-        }
-    finally:
-        if pipe is not None:
-            _destroy_pipe(pipe)
-
-
-# ---------------------------
+# ------------------------------------------------------------
 # RunPod handler
-# ---------------------------
+# ------------------------------------------------------------
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
         inp = job.get("input") or {}
-        mode = str(inp.get("mode") or "").strip().lower()
 
         ping = str(inp.get("ping") or "").strip().lower()
+        mode = str(inp.get("mode") or "").strip().lower()
+
+        # Compat: mode=t2v/i2v
+        if not ping and mode:
+            if mode == "t2v":
+                ping = "t2v_generate"
+            elif mode == "i2v":
+                ping = "i2v_generate"
+
+        # Debug endpoints
         if ping in ("echo", "debug"):
             return {
                 "ok": True,
@@ -600,25 +625,64 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 "input": inp,
                 "gpu_info": _gpu_info(),
                 **_diffusers_info(),
+                "env": {
+                    "WAN_T2V_PATH": os.environ.get("WAN_T2V_PATH"),
+                    "WAN_I2V_PATH": os.environ.get("WAN_I2V_PATH"),
+                },
                 "resolved_paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
-                "pod_defaults": {"w": POD_W, "h": POD_H, "fps": POD_FPS, "frames": POD_FRAMES, "steps": POD_STEPS, "cfg": POD_CFG},
+                "sizes": {
+                    "pod_default": {"w": POD_W, "h": POD_H},
+                    "reels_9_16": {"w": REELS_W, "h": REELS_H},
+                },
+                "notes": "Frames se ajustan a WAN: (num_frames-1)%4==0",
             }
 
-        if mode == "t2v":
+        if ping == "list_paths":
+            candidates = [
+                "/",
+                "/workspace",
+                "/workspace/models",
+                "/workspace/models/wan22",
+                "/runpod-volume",
+                "/runpod-volume/models",
+                "/runpod-volume/models/wan22",
+                MODEL_T2V_LOCAL,
+                MODEL_I2V_LOCAL,
+            ]
+            return {
+                "ok": True,
+                "candidates": {p: _list_dir_safe(p, 50) for p in candidates},
+                "gpu_info": _gpu_info(),
+                **_diffusers_info(),
+            }
+
+        if ping in ("t2v_generate",) or mode == "t2v":
             return _t2v_generate(inp)
-        if mode == "i2v":
+
+        if ping in ("i2v_generate",) or mode == "i2v":
             return _i2v_generate(inp)
 
-        return {"ok": False, "error": "Modo inválido (usa mode='t2v' o mode='i2v').", "gpu_info": _gpu_info()}
+        return {"ok": False, "error": "Modo inválido (usa mode=t2v o mode=i2v)"}
+
+    except torch.cuda.OutOfMemoryError as e:
+        # 🔥 si OOM, sí limpiamos duro y descargamos pipes
+        _unload_pipes(keep=None)
+        return {
+            "ok": False,
+            "error": f"CUDA OOM: {str(e)}",
+            "trace": traceback.format_exc(),
+            **_diffusers_info(),
+            "gpu_info": _gpu_info(),
+        }
     except Exception as e:
-        _hard_cleanup()
+        # Limpieza dura para evitar que quede VRAM sucia
+        _hard_cleanup(sync=True)
         return {
             "ok": False,
             "error": str(e),
             "trace": traceback.format_exc(),
-            "gpu_info": _gpu_info(),
             **_diffusers_info(),
+            "gpu_info": _gpu_info(),
         }
-
 
 runpod.serverless.start({"handler": handler})
