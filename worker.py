@@ -332,15 +332,20 @@ def _snap16(n: int) -> int:
     r = int(round(n / 16.0) * 16)
     return max(16, r)
 
+# ✅ FIX REAL: WAN exige (num_frames - 1) % 4 == 0
 def _fix_frames_for_wan(n: int) -> int:
     """
     WAN: (num_frames - 1) MUST be divisible by 4.
-    Evitamos que diffusers "redondee" adentro (eso causó tu mismatch).
+    Evitamos que diffusers "redondee" adentro (eso causó mismatch).
+    IMPORTANTE: NO redondear "nearest", siempre subir al siguiente válido.
     """
     n = int(n)
     if n < 5:
         return 5
-    return int(1 + 4 * round((n - 1) / 4))
+    r = (n - 1) % 4
+    if r == 0:
+        return n
+    return n + (4 - r)
 
 # ✅ POD default landscape
 POD_W, POD_H = 1280, 720
@@ -361,12 +366,17 @@ def _normalize_timing(inp: Dict[str, Any]) -> Tuple[int, int, int]:
     seconds_raw = inp.get("duration_s", inp.get("seconds", 3))
     seconds = _clamp_int(seconds_raw, 1, 10, 3)
 
-    # si mandan num_frames, lo respetamos (POD behavior), pero lo arreglamos a WAN-format
-    raw_frames = inp.get("num_frames", inp.get("frames", seconds * fps))
-    try:
-        raw_frames = int(raw_frames)
-    except Exception:
-        raw_frames = int(seconds * fps)
+    # ✅ REGLA: si hay duration_s, calculamos frames desde seconds*fps
+    # (ignoramos num_frames del cliente para evitar inconsistencias)
+    raw_frames = int(seconds * fps)
+
+    # pero si NO mandan duration, sí podemos tomar num_frames
+    if "duration_s" not in inp and "seconds" not in inp:
+        raw_frames = inp.get("num_frames", inp.get("frames", raw_frames))
+        try:
+            raw_frames = int(raw_frames)
+        except Exception:
+            raw_frames = int(seconds * fps)
 
     num_frames = _fix_frames_for_wan(raw_frames)
     return int(seconds), int(fps), int(num_frames)
@@ -477,6 +487,8 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     negative = negative if negative else None
 
     seconds, fps, num_frames = _normalize_timing(inp)
+    raw_frames = int(seconds * fps)
+
     w_raw, h_raw = _pick_dims(inp)
     width, height = _snap16(w_raw), _snap16(h_raw)
 
@@ -484,7 +496,7 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     steps = _clamp_int(inp.get("steps", 34), 1, 80, 34)
     guidance_scale = float(inp.get("guidance_scale", 6.5) or 6.5)
 
-    print(f"[T2V] w={width} h={height} fps={fps} frames={num_frames} steps={steps} cfg={guidance_scale}")
+    print(f"[T2V] w={width} h={height} fps={fps} raw_frames={raw_frames} FIXED_frames={num_frames} steps={steps} cfg={guidance_scale}")
 
     t0 = time.time()
     with torch.inference_mode():
@@ -538,6 +550,8 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     negative = negative if negative else None
 
     seconds, fps, num_frames = _normalize_timing(inp)
+    raw_frames = int(seconds * fps)
+
     w_raw, h_raw = _pick_dims(inp)
     width, height = _snap16(w_raw), _snap16(h_raw)
 
@@ -550,7 +564,7 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     steps = _clamp_int(inp.get("steps", 34), 1, 80, 34)
     guidance_scale = float(inp.get("guidance_scale", 6.5) or 6.5)
 
-    print(f"[I2V] w={width} h={height} fps={fps} frames={num_frames} steps={steps} cfg={guidance_scale}")
+    print(f"[I2V] w={width} h={height} fps={fps} raw_frames={raw_frames} FIXED_frames={num_frames} steps={steps} cfg={guidance_scale}")
 
     t0 = time.time()
     with torch.inference_mode():
@@ -634,8 +648,11 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     "pod_default": {"w": POD_W, "h": POD_H},
                     "reels_9_16": {"w": REELS_W, "h": REELS_H},
                 },
-                "notes": "Frames se ajustan a WAN: (num_frames-1)%4==0",
+                "notes": "Frames se ajustan a WAN: (num_frames-1)%4==0 (siempre sube al siguiente válido).",
             }
+
+        if ping == "gpu_sanity":
+            return {"ok": True, **_gpu_info(), **_diffusers_info()}
 
         if ping == "list_paths":
             candidates = [
@@ -651,38 +668,29 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             ]
             return {
                 "ok": True,
-                "candidates": {p: _list_dir_safe(p, 50) for p in candidates},
-                "gpu_info": _gpu_info(),
+                "candidates": {p: _list_dir_safe(p, limit=120) for p in candidates},
+                "resolved_paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
                 **_diffusers_info(),
+                "gpu_info": _gpu_info(),
             }
 
-        if ping in ("t2v_generate",) or mode == "t2v":
+        # Generación
+        if ping == "t2v_generate":
             return _t2v_generate(inp)
-
-        if ping in ("i2v_generate",) or mode == "i2v":
+        if ping == "i2v_generate":
             return _i2v_generate(inp)
 
-        return {"ok": False, "error": "Modo inválido (usa mode=t2v o mode=i2v)"}
+        return {"ok": False, "error": "Ping/Modo inválido", "gpu_info": _gpu_info(), **_diffusers_info()}
 
-    except torch.cuda.OutOfMemoryError as e:
-        # 🔥 si OOM, sí limpiamos duro y descargamos pipes
-        _unload_pipes(keep=None)
-        return {
-            "ok": False,
-            "error": f"CUDA OOM: {str(e)}",
-            "trace": traceback.format_exc(),
-            **_diffusers_info(),
-            "gpu_info": _gpu_info(),
-        }
     except Exception as e:
-        # Limpieza dura para evitar que quede VRAM sucia
+        # 🔥 Limpieza fuerte si algo falla
         _hard_cleanup(sync=True)
         return {
             "ok": False,
             "error": str(e),
             "trace": traceback.format_exc(),
-            **_diffusers_info(),
             "gpu_info": _gpu_info(),
+            **_diffusers_info(),
         }
 
 runpod.serverless.start({"handler": handler})
