@@ -1,6 +1,8 @@
 # worker.py (RunPod Serverless) — IsabelaOS Video Worker (WAN)
-# ✅ MISMO worker que tenías, solo con PATCH de limpieza + firma + frames WAN
-# ✅ FIX CRÍTICO: quitar expandable_segments (causa INTERNAL ASSERT FAILED)
+# ✅ MISMO worker que tenías
+# ✅ PATCH: limpieza + firma + frames WAN
+# ✅ FIX CRÍTICO: FORZAR expandable_segments OFF (evita INTERNAL ASSERT FAILED)
+# ✅ DEBUG: imprime el alloc_conf real al boot para confirmar que NO quedó True
 
 import os
 import time
@@ -11,13 +13,19 @@ import traceback
 from io import BytesIO
 from typing import Any, Dict, Optional, Tuple
 
-# --- ENV hardening ---
+# -------------------------------------------------------------------
+# ENV hardening (ANTES de importar torch)
+# -------------------------------------------------------------------
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# ✅ FIX CRÍTICO (SERVERLESS): NO usar expandable_segments (rompe torch en warm state)
-# Antes: "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.8"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256,garbage_collection_threshold:0.8"
+# ✅ FIX CRÍTICO: apagar expandable_segments SÍ O SÍ
+# (si RunPod lo está inyectando, esto lo sobreescribe al nivel del proceso)
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+    "expandable_segments:False,max_split_size_mb:256,garbage_collection_threshold:0.8"
+)
+
+print("[BOOT] PYTORCH_CUDA_ALLOC_CONF =", os.environ.get("PYTORCH_CUDA_ALLOC_CONF"))
 
 # --- hf cached_download compatibility ---
 import huggingface_hub as h
@@ -363,9 +371,7 @@ def _normalize_timing(inp: Dict[str, Any]) -> Tuple[int, int, int]:
 
     fps = _clamp_int(inp.get("fps", 12), 8, 30, 12)
 
-    # frames base
     num_frames = seconds * fps
-    # ✅ PATCH: forzar frames válidos WAN
     num_frames = _fix_frames_for_wan(num_frames)
 
     return seconds, fps, num_frames
@@ -394,7 +400,6 @@ def _unload_pipes(keep: Optional[str] = None):
 
     _hard_cleanup()
 
-# ✅ PATCH: si cambian width/height/frames y el pipe está vivo => reload limpio
 def _ensure_t2v_signature(width: int, height: int, num_frames: int):
     global _pipe_t2v, _last_sig_t2v
     sig = (int(width), int(height), int(num_frames))
@@ -529,7 +534,6 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     width = _snap16(width_raw)
     height = _snap16(height_raw)
 
-    # ✅ PATCH: firma (si cambia => reload limpio)
     _ensure_t2v_signature(width, height, num_frames)
 
     pipe = _load_t2v(unload_other=True)
@@ -555,7 +559,6 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     mp4_bytes = _frames_to_mp4_bytes(frames, fps=fps)
     mp4_b64 = base64.b64encode(mp4_bytes).decode("utf-8")
 
-    # ✅ PATCH: cleanup entre jobs (serverless warm)
     _cuda_cleanup()
 
     return {
@@ -571,6 +574,8 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
         "elapsed_s": round(time.time() - t0, 3),
         "video_b64": mp4_b64,
         "video_mime": "video/mp4",
+        "gpu_info": _gpu_info(),
+        **_diffusers_info(),
     }
 
 def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
@@ -599,7 +604,6 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # ✅ PATCH: firma (si cambia => reload limpio)
     _ensure_i2v_signature(width, height, num_frames)
 
     pipe = _load_i2v(unload_other=True)
@@ -638,6 +642,8 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
         "elapsed_s": round(time.time() - t0, 3),
         "video_b64": mp4_b64,
         "video_mime": "video/mp4",
+        "gpu_info": _gpu_info(),
+        **_diffusers_info(),
     }
 
 # ---------------------------
@@ -655,6 +661,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             elif mode == "i2v":
                 ping = "i2v_generate"
 
+        # ---- debug endpoints ----
         if ping in ("echo", "debug"):
             ftfy_ok = True
             try:
@@ -680,25 +687,55 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     "default": {"w": DEFAULT_W, "h": DEFAULT_H},
                     "reels_9_16": {"w": REELS_W, "h": REELS_H},
                 },
-                "notes": "PATCH: frames WAN + signature reload + cleanup real + FIX allocator(no expandable_segments)",
+                "notes": "PATCH: frames WAN + signature reload + cleanup real + expandable_segments OFF",
             }
 
         if ping == "smoke":
-            return {"ok": True, "msg": "SMOKE_OK", "gpu_info": _gpu_info(), **_diffusers_info()}
+            return {
+                "ok": True,
+                "msg": "SMOKE_OK",
+                "gpu_info": _gpu_info(),
+                **_diffusers_info(),
+                "env": {"PYTORCH_CUDA_ALLOC_CONF": os.environ.get("PYTORCH_CUDA_ALLOC_CONF")},
+            }
 
-        # ✅ Ejecutores
-        if ping == "t2v_generate":
+        if ping == "gpu_sanity":
+            return {"ok": True, **_gpu_info(), **_diffusers_info()}
+
+        # ---- main actions ----
+        if ping in ("t2v_generate", "t2v"):
             return _t2v_generate(inp)
 
-        if ping == "i2v_generate":
+        if ping in ("i2v_generate", "i2v"):
             return _i2v_generate(inp)
 
-        # fallback: si no mandan ping correcto
+        if ping == "list_paths":
+            candidates = [
+                "/",
+                "/workspace",
+                "/workspace/models",
+                "/workspace/models/wan22",
+                "/runpod-volume",
+                "/runpod-volume/models",
+                "/runpod-volume/models/wan22",
+                MODEL_T2V_LOCAL,
+                MODEL_I2V_LOCAL,
+            ]
+            return {
+                "ok": True,
+                "candidates": candidates,
+                "listing": {p: _list_dir_safe(p) for p in candidates},
+                "gpu_info": _gpu_info(),
+                **_diffusers_info(),
+                "env": {"PYTORCH_CUDA_ALLOC_CONF": os.environ.get("PYTORCH_CUDA_ALLOC_CONF")},
+            }
+
         return {
             "ok": False,
-            "error": f"Unknown ping/mode: ping='{ping}' mode='{mode}'",
+            "error": f"Unknown ping/mode. ping='{ping}' mode='{mode}'",
             "gpu_info": _gpu_info(),
             **_diffusers_info(),
+            "env": {"PYTORCH_CUDA_ALLOC_CONF": os.environ.get("PYTORCH_CUDA_ALLOC_CONF")},
         }
 
     except Exception as e:
@@ -708,9 +745,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             "trace": traceback.format_exc(),
             "gpu_info": _gpu_info(),
             **_diffusers_info(),
+            "env": {"PYTORCH_CUDA_ALLOC_CONF": os.environ.get("PYTORCH_CUDA_ALLOC_CONF")},
         }
 
-# ---------------------------
-# RunPod Serverless start
-# ---------------------------
+
 runpod.serverless.start({"handler": handler})
