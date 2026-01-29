@@ -5,6 +5,7 @@
 # - SIN errores aleatorios (OOM / mismatch frames)
 # - Limpieza REAL de VRAM entre requests
 # - NO inventa parámetros raros
+# - ✅ PARCHE CLAVE: si cambian dims/frames => reload total (evita cache mismatch)
 # ============================================================
 
 import os
@@ -22,7 +23,6 @@ from typing import Any, Dict, Optional, Tuple
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# 🔥 CRÍTICO: reduce fragmentación en serverless
 os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF",
     "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.8"
@@ -42,7 +42,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Buenas prácticas (no rompe nada)
 if torch.cuda.is_available():
     try:
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -106,10 +105,14 @@ MODEL_T2V_LOCAL = _normalize_model_path(os.environ.get("WAN_T2V_PATH", DEFAULT_T
 MODEL_I2V_LOCAL = _normalize_model_path(os.environ.get("WAN_I2V_PATH", DEFAULT_I2V_PATH))
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32  # WAN estable en fp16
+DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
 _pipe_t2v = None
 _pipe_i2v = None
+
+# ✅ signatures para evitar cache mismatch (rotary/pos buffers)
+_last_sig_t2v: Optional[Tuple[int,int,int]] = None  # (w,h,num_frames)
+_last_sig_i2v: Optional[Tuple[int,int,int]] = None
 
 # ------------------------------------------------------------
 # VRAM CLEANUP REAL
@@ -130,6 +133,10 @@ def _cuda_cleanup(sync=True):
         torch.cuda.ipc_collect()
     except Exception:
         pass
+    try:
+        torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
 
 def _hard_cleanup(sync=True):
     try:
@@ -145,7 +152,7 @@ def _safe_pipe_to_cpu(pipe):
         pass
 
 def _unload_pipes(keep: Optional[str] = None):
-    global _pipe_t2v, _pipe_i2v
+    global _pipe_t2v, _pipe_i2v, _last_sig_t2v, _last_sig_i2v
 
     if keep != "t2v" and _pipe_t2v is not None:
         _safe_pipe_to_cpu(_pipe_t2v)
@@ -154,6 +161,7 @@ def _unload_pipes(keep: Optional[str] = None):
         except Exception:
             pass
         _pipe_t2v = None
+        _last_sig_t2v = None
 
     if keep != "i2v" and _pipe_i2v is not None:
         _safe_pipe_to_cpu(_pipe_i2v)
@@ -162,6 +170,7 @@ def _unload_pipes(keep: Optional[str] = None):
         except Exception:
             pass
         _pipe_i2v = None
+        _last_sig_i2v = None
 
     _hard_cleanup(sync=True)
 
@@ -193,7 +202,6 @@ def _assert_model_dir(path: str, label: str):
         raise RuntimeError(f"{label} model path not found: {path}")
 
 def _pipe_memory_tweaks(pipe):
-    # Ajustes seguros (no cambian “look”, solo ayudan memoria)
     try:
         pipe.enable_attention_slicing("max")
     except Exception:
@@ -209,7 +217,6 @@ def _pipe_memory_tweaks(pipe):
     return pipe
 
 def _lazy_import_wan():
-    # Importa solo cuando se necesita (más rápido en cold start)
     from diffusers import WanPipeline, WanImageToVideoPipeline, AutoencoderKLWan
     return WanPipeline, WanImageToVideoPipeline, AutoencoderKLWan
 
@@ -247,15 +254,13 @@ def _to_uint8_hwc(frame):
         arr = np.array(frame.convert("RGB"), dtype=np.uint8)
         return arr
     if torch.is_tensor(frame):
-        t = frame.detach().float().cpu().numpy()
-        arr = t
+        arr = frame.detach().float().cpu().numpy()
     else:
         arr = np.asarray(frame)
 
     while arr.ndim >= 4 and arr.shape[0] == 1:
         arr = arr[0]
 
-    # (C,H,W)->(H,W,C)
     if arr.ndim == 3:
         c_first = arr.shape[0] in (1, 3, 4)
         c_last_ok = arr.shape[-1] in (1, 3, 4)
@@ -279,7 +284,6 @@ def _normalize_frames(frames):
             frames = frames[0]
         if frames.ndim == 4:
             return [_to_uint8_hwc(frames[i]) for i in range(frames.shape[0])]
-
     return [_to_uint8_hwc(f) for f in frames]
 
 def _frames_to_mp4_bytes(frames, fps: int = 24) -> bytes:
@@ -332,13 +336,9 @@ def _snap16(n: int) -> int:
     r = int(round(n / 16.0) * 16)
     return max(16, r)
 
-# ✅ FIX REAL: WAN exige (num_frames - 1) % 4 == 0
+# ✅ WAN exige: (num_frames - 1) % 4 == 0
+# ✅ IMPORTANTÍSIMO: subir (ceil) al siguiente válido para evitar que diffusers “redondee”
 def _fix_frames_for_wan(n: int) -> int:
-    """
-    WAN: (num_frames - 1) MUST be divisible by 4.
-    Evitamos que diffusers "redondee" adentro (eso causó mismatch).
-    IMPORTANTE: NO redondear "nearest", siempre subir al siguiente válido.
-    """
     n = int(n)
     if n < 5:
         return 5
@@ -347,17 +347,13 @@ def _fix_frames_for_wan(n: int) -> int:
         return n
     return n + (4 - r)
 
-# ✅ POD default landscape
 POD_W, POD_H = 1280, 720
-
-# ✅ Reels 9:16 (rápido)
 REELS_W, REELS_H = 576, 1024
 
 def _pick_dims(inp: Dict[str, Any]) -> Tuple[int, int]:
     ar = str(inp.get("aspect_ratio") or "").strip()
     if ar == "9:16":
         return REELS_W, REELS_H
-    # default = POD-like
     return POD_W, POD_H
 
 def _normalize_timing(inp: Dict[str, Any]) -> Tuple[int, int, int]:
@@ -366,11 +362,10 @@ def _normalize_timing(inp: Dict[str, Any]) -> Tuple[int, int, int]:
     seconds_raw = inp.get("duration_s", inp.get("seconds", 3))
     seconds = _clamp_int(seconds_raw, 1, 10, 3)
 
-    # ✅ REGLA: si hay duration_s, calculamos frames desde seconds*fps
-    # (ignoramos num_frames del cliente para evitar inconsistencias)
+    # ✅ Si mandan duration => frames SIEMPRE = seconds*fps (evita inconsistencias del front)
     raw_frames = int(seconds * fps)
 
-    # pero si NO mandan duration, sí podemos tomar num_frames
+    # Si NO mandan duration/seconds => aceptar num_frames pero sanear
     if "duration_s" not in inp and "seconds" not in inp:
         raw_frames = inp.get("num_frames", inp.get("frames", raw_frames))
         try:
@@ -399,7 +394,6 @@ def _load_t2v(unload_other=True):
     print(f"[WAN_LOAD] Loading T2V LOCAL from: {MODEL_T2V_LOCAL}")
     print(f"[WAN_LOAD] dtype={DTYPE} device={DEVICE}")
 
-    # VAE float32 estable, resto fp16
     vae = AutoencoderKLWan.from_pretrained(
         MODEL_T2V_LOCAL,
         subfolder="vae",
@@ -474,11 +468,42 @@ def _load_i2v(unload_other=True):
     return _pipe_i2v
 
 # ------------------------------------------------------------
+# ✅ PARCHE CLAVE: si cambian (w,h,frames) => reload limpio
+# ------------------------------------------------------------
+def _ensure_t2v_signature(width: int, height: int, num_frames: int):
+    global _pipe_t2v, _last_sig_t2v
+    sig = (int(width), int(height), int(num_frames))
+    if _pipe_t2v is None:
+        _last_sig_t2v = sig
+        return
+    if _last_sig_t2v is None:
+        _last_sig_t2v = sig
+        return
+    if sig != _last_sig_t2v:
+        print(f"[SIG] T2V signature changed {_last_sig_t2v} -> {sig} | forcing reload to avoid cache mismatch")
+        _unload_pipes(keep=None)  # descarga todo
+        _pipe_t2v = None
+        _last_sig_t2v = sig
+
+def _ensure_i2v_signature(width: int, height: int, num_frames: int):
+    global _pipe_i2v, _last_sig_i2v
+    sig = (int(width), int(height), int(num_frames))
+    if _pipe_i2v is None:
+        _last_sig_i2v = sig
+        return
+    if _last_sig_i2v is None:
+        _last_sig_i2v = sig
+        return
+    if sig != _last_sig_i2v:
+        print(f"[SIG] I2V signature changed {_last_sig_i2v} -> {sig} | forcing reload to avoid cache mismatch")
+        _unload_pipes(keep=None)
+        _pipe_i2v = None
+        _last_sig_i2v = sig
+
+# ------------------------------------------------------------
 # Generators
 # ------------------------------------------------------------
 def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
-    pipe = _load_t2v(unload_other=True)
-
     prompt = str(inp.get("prompt") or "").strip()
     if not prompt:
         raise RuntimeError("Falta prompt")
@@ -487,16 +512,18 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     negative = negative if negative else None
 
     seconds, fps, num_frames = _normalize_timing(inp)
-    raw_frames = int(seconds * fps)
-
     w_raw, h_raw = _pick_dims(inp)
     width, height = _snap16(w_raw), _snap16(h_raw)
 
-    # Respetar valores POD si vienen:
+    # ✅ asegurar signature BEFORE cargar pipeline
+    _ensure_t2v_signature(width, height, num_frames)
+
+    pipe = _load_t2v(unload_other=True)
+
     steps = _clamp_int(inp.get("steps", 34), 1, 80, 34)
     guidance_scale = float(inp.get("guidance_scale", 6.5) or 6.5)
 
-    print(f"[T2V] w={width} h={height} fps={fps} raw_frames={raw_frames} FIXED_frames={num_frames} steps={steps} cfg={guidance_scale}")
+    print(f"[T2V] w={width} h={height} fps={fps} frames={num_frames} steps={steps} cfg={guidance_scale}")
 
     t0 = time.time()
     with torch.inference_mode():
@@ -505,7 +532,7 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
             negative_prompt=negative,
             width=width,
             height=height,
-            num_frames=num_frames,              # ✅ YA arreglado al formato WAN
+            num_frames=num_frames,
             num_inference_steps=steps,
             guidance_scale=guidance_scale,
         )
@@ -514,7 +541,6 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     mp4_bytes = _frames_to_mp4_bytes(frames, fps=fps)
     mp4_b64 = base64.b64encode(mp4_bytes).decode("utf-8")
 
-    # Limpieza ligera entre jobs (sin matar pipeline)
     _cuda_cleanup(sync=False)
 
     return {
@@ -535,8 +561,6 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
-    pipe = _load_i2v(unload_other=True)
-
     prompt = str(inp.get("prompt") or "").strip()
     if not prompt:
         raise RuntimeError("Falta prompt")
@@ -546,25 +570,28 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
         raise RuntimeError("Falta image_b64")
 
     init_img = _b64_to_pil_image(str(image_b64))
+
     negative = str(inp.get("negative_prompt") or "").strip()
     negative = negative if negative else None
 
     seconds, fps, num_frames = _normalize_timing(inp)
-    raw_frames = int(seconds * fps)
-
     w_raw, h_raw = _pick_dims(inp)
     width, height = _snap16(w_raw), _snap16(h_raw)
 
-    # Resize init image al tamaño estable elegido
+    # Resize init image al tamaño elegido
     try:
         init_img = init_img.resize((width, height))
     except Exception:
         pass
 
+    _ensure_i2v_signature(width, height, num_frames)
+
+    pipe = _load_i2v(unload_other=True)
+
     steps = _clamp_int(inp.get("steps", 34), 1, 80, 34)
     guidance_scale = float(inp.get("guidance_scale", 6.5) or 6.5)
 
-    print(f"[I2V] w={width} h={height} fps={fps} raw_frames={raw_frames} FIXED_frames={num_frames} steps={steps} cfg={guidance_scale}")
+    print(f"[I2V] w={width} h={height} fps={fps} frames={num_frames} steps={steps} cfg={guidance_scale}")
 
     t0 = time.time()
     with torch.inference_mode():
@@ -574,7 +601,7 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
             negative_prompt=negative,
             width=width,
             height=height,
-            num_frames=num_frames,              # ✅ YA arreglado al formato WAN
+            num_frames=num_frames,
             num_inference_steps=steps,
             guidance_scale=guidance_scale,
         )
@@ -624,14 +651,12 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         ping = str(inp.get("ping") or "").strip().lower()
         mode = str(inp.get("mode") or "").strip().lower()
 
-        # Compat: mode=t2v/i2v
         if not ping and mode:
             if mode == "t2v":
                 ping = "t2v_generate"
             elif mode == "i2v":
                 ping = "i2v_generate"
 
-        # Debug endpoints
         if ping in ("echo", "debug"):
             return {
                 "ok": True,
@@ -648,7 +673,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     "pod_default": {"w": POD_W, "h": POD_H},
                     "reels_9_16": {"w": REELS_W, "h": REELS_H},
                 },
-                "notes": "Frames se ajustan a WAN: (num_frames-1)%4==0 (siempre sube al siguiente válido).",
+                "notes": "Frames se ajustan a WAN: (num_frames-1)%4==0. Si cambian dims/frames => reload total (evita cache mismatch).",
             }
 
         if ping == "gpu_sanity":
@@ -674,16 +699,15 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 "gpu_info": _gpu_info(),
             }
 
-        # Generación
         if ping == "t2v_generate":
             return _t2v_generate(inp)
+
         if ping == "i2v_generate":
             return _i2v_generate(inp)
 
         return {"ok": False, "error": "Ping/Modo inválido", "gpu_info": _gpu_info(), **_diffusers_info()}
 
     except Exception as e:
-        # 🔥 Limpieza fuerte si algo falla
         _hard_cleanup(sync=True)
         return {
             "ok": False,
