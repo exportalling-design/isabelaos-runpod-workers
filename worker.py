@@ -1,11 +1,19 @@
-# worker.py (RunPod Serverless)
+# worker.py (RunPod Serverless) — IsabelaOS Video Worker (WAN)
+# ✅ Cambios aplicados:
+# 1) ✅ Traceback completo en errores (para depurar de verdad).
+# 2) ✅ DTYPE en GPU = torch.float16 (evita muchos “engine/kernels” raros con bfloat16).
+# 3) ✅ Solo 2 tamaños: DEFAULT (rápido y común) y 9:16 (Reels/TikTok).
+# 4) ✅ Snap /16 para evitar errores de tamaño no divisible por 16.
+# 5) ✅ Logs de carga y ejecución más claros.
+
 import os
 import time
 import gc
 import base64
 import binascii
+import traceback
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 # --- ENV hardening ---
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
@@ -76,7 +84,10 @@ MODEL_T2V_LOCAL = _normalize_model_path(os.environ.get("WAN_T2V_PATH", DEFAULT_T
 MODEL_I2V_LOCAL = _normalize_model_path(os.environ.get("WAN_I2V_PATH", DEFAULT_I2V_PATH))
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+
+# ✅ IMPORTANT: Evitar bfloat16 en WAN (muy común que cause “engine”/kernel errors).
+# A100 va perfecto con fp16.
+DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
 _pipe_t2v = None
 _pipe_i2v = None
@@ -127,9 +138,13 @@ def _diffusers_info():
 
 def _assert_model_dir(path: str, label: str):
     if not os.path.isdir(path):
-        raise RuntimeError(f"{label} model path not found: {path}. (En serverless puede ser /runpod-volume/...)")
+        raise RuntimeError(
+            f"{label} model path not found: {path}. "
+            "(En serverless casi siempre es /runpod-volume/...)"
+        )
 
 def _pipe_memory_tweaks(pipe):
+    # Tuning seguro para memoria; no debería romper kernels
     try:
         pipe.enable_attention_slicing("max")
     except Exception:
@@ -327,7 +342,7 @@ def _extract_frames(result):
     raise RuntimeError(f"Could not extract frames from result type={type(result)}")
 
 # ---------------------------
-# Timing + Dims helpers (3s/5s + /16)
+# Timing + Dims helpers
 # ---------------------------
 def _clamp_int(v, lo: int, hi: int, default: int) -> int:
     try:
@@ -338,67 +353,44 @@ def _clamp_int(v, lo: int, hi: int, default: int) -> int:
 
 def _snap16(n: int) -> int:
     n = int(n)
-    # round to nearest multiple of 16
     r = int(round(n / 16.0) * 16)
     return max(16, r)
 
-def _pick_dims(width, height, aspect_ratio: str = "", platform_ref: str = "") -> Tuple[int, int]:
-    # 1) Si vienen width/height válidos, respétalos
-    try:
-        w = int(width) if width is not None else None
-        h = int(height) if height is not None else None
-        if w and h and w > 0 and h > 0:
-            return w, h
-    except Exception:
-        pass
+# ✅ SOLO 2 TAMAÑOS:
+# - DEFAULT: más común y rápido (recomendado para “video desde prompt”)
+# - 9:16: Reels/TikTok
+DEFAULT_W, DEFAULT_H = 576, 1024          # rápido, buena calidad vs tiempo
+REELS_W, REELS_H = 576, 1024              # 9:16 real (más rápido que 1080x1920)
 
-    ar = (aspect_ratio or "").strip()
-
-    # 2) aspect_ratio explícito
+def _pick_dims_simple(inp: Dict[str, Any]) -> Tuple[int, int]:
+    """
+    Elegimos solo 2 casos:
+    - Si el cliente manda aspect_ratio = "9:16" -> Reels (576x1024)
+    - Si no manda nada -> Default (576x1024)
+    Nota: aquí dejamos ambos iguales por velocidad y simplicidad.
+    Si luego quieres “default landscape”, cambias DEFAULT_W/H.
+    """
+    ar = str(inp.get("aspect_ratio") or "").strip()
     if ar == "9:16":
-        return 1080, 1920
-    if ar == "1:1":
-        return 1080, 1080
-    if ar == "16:9":
-        return 1920, 1080
-    if ar == "4:5":
-        return 1080, 1350
-    if ar == "4:3":
-        return 1440, 1080
-
-    # 3) platform_ref
-    p = (platform_ref or "").lower().strip()
-    if p == "tiktok":
-        return 1080, 1920
-    if p == "instagram":
-        return 1080, 1920
-    if p == "youtube":
-        return 1920, 1080
-    if p == "facebook":
-        return 1440, 1080
-
-    # 4) fallback
-    return 768, 432
+        return REELS_W, REELS_H
+    return DEFAULT_W, DEFAULT_H
 
 def _normalize_timing(inp: Dict[str, Any]) -> Tuple[int, int, int]:
+    # seconds: solo 3 o 5 (manteniendo tu lógica)
     seconds_raw = inp.get("duration_s", None)
     if seconds_raw is None:
         seconds_raw = inp.get("seconds", None)
     if seconds_raw is None:
-        seconds_raw = 4
+        seconds_raw = 3
 
     seconds = _clamp_int(seconds_raw, 3, 5, 3)
     seconds = 3 if seconds < 4 else 5
 
-    fps = _clamp_int(inp.get("fps", 24), 8, 60, 24)
+    # fps: bajarlo ayuda MUCHO a velocidad (en especial serverless)
+    fps = _clamp_int(inp.get("fps", 12), 8, 30, 12)
 
-    nf_raw = inp.get("num_frames", None)
-    if nf_raw is None:
-        nf_raw = inp.get("frames", None)
-    if nf_raw is None:
-        nf_raw = seconds * fps
-
-    num_frames = _clamp_int(nf_raw, 1, 9999, seconds * fps)
+    # frames: si el cliente manda algo raro, lo “amarramos” a seconds*fps
+    num_frames = seconds * fps
     return seconds, fps, num_frames
 
 # ---------------------------
@@ -439,7 +431,9 @@ def _load_t2v(unload_other: bool = True):
 
     t0 = time.time()
     print(f"[WAN_LOAD] Loading T2V LOCAL from: {MODEL_T2V_LOCAL}")
+    print(f"[WAN_LOAD] Using dtype={DTYPE} device={DEVICE}")
 
+    # VAE en float32 (estable), pipeline en fp16 (rápido)
     vae = AutoencoderKLWan.from_pretrained(
         MODEL_T2V_LOCAL,
         subfolder="vae",
@@ -482,6 +476,7 @@ def _load_i2v(unload_other: bool = True):
 
     t0 = time.time()
     print(f"[WAN_LOAD] Loading I2V LOCAL from: {MODEL_I2V_LOCAL}")
+    print(f"[WAN_LOAD] Using dtype={DTYPE} device={DEVICE}")
 
     vae = AutoencoderKLWan.from_pretrained(
         MODEL_I2V_LOCAL,
@@ -517,20 +512,21 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
         raise RuntimeError("Falta prompt")
 
     negative = str(inp.get("negative_prompt") or "").strip()
-    platform_ref = str(inp.get("platform_ref") or "")
-    aspect_ratio = str(inp.get("aspect_ratio") or "")
 
     seconds, fps, num_frames = _normalize_timing(inp)
-    width_raw, height_raw = _pick_dims(inp.get("width"), inp.get("height"), aspect_ratio, platform_ref)
 
-    # ✅ SNAP /16 (esto evita el error: width/height must be divisible by 16)
+    # ✅ SOLO 2 tamaños (default o 9:16)
+    width_raw, height_raw = _pick_dims_simple(inp)
     width = _snap16(width_raw)
     height = _snap16(height_raw)
 
-    steps = _clamp_int(inp.get("steps", 20), 1, 80, 20)
+    # steps: para serverless, 12–20 es razonable
+    steps = _clamp_int(inp.get("steps", 16), 1, 80, 16)
     guidance_scale = float(inp.get("guidance_scale", 5.0) or 5.0)
 
     t0 = time.time()
+    print(f"[T2V] start prompt='{prompt[:80]}' w={width} h={height} frames={num_frames} fps={fps} steps={steps}")
+
     with torch.inference_mode():
         result = pipe(
             prompt=prompt,
@@ -557,7 +553,6 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
         "steps": steps,
         "guidance_scale": guidance_scale,
         "elapsed_s": round(time.time() - t0, 3),
-        # ✅ lo importante:
         "video_b64": mp4_b64,
         "video_mime": "video/mp4",
     }
@@ -576,25 +571,25 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     init_img = _b64_to_pil_image(str(image_b64))
 
     negative = str(inp.get("negative_prompt") or "").strip()
-    platform_ref = str(inp.get("platform_ref") or "")
-    aspect_ratio = str(inp.get("aspect_ratio") or "")
 
     seconds, fps, num_frames = _normalize_timing(inp)
-    width_raw, height_raw = _pick_dims(inp.get("width"), inp.get("height"), aspect_ratio, platform_ref)
 
+    width_raw, height_raw = _pick_dims_simple(inp)
     width = _snap16(width_raw)
     height = _snap16(height_raw)
 
-    steps = _clamp_int(inp.get("steps", 20), 1, 80, 20)
+    steps = _clamp_int(inp.get("steps", 16), 1, 80, 16)
     guidance_scale = float(inp.get("guidance_scale", 5.0) or 5.0)
 
-    # (opcional) resize init image al tamaño que pedimos
+    # Resize init image al tamaño fijo
     try:
         init_img = init_img.resize((width, height))
     except Exception:
         pass
 
     t0 = time.time()
+    print(f"[I2V] start w={width} h={height} frames={num_frames} fps={fps} steps={steps}")
+
     with torch.inference_mode():
         result = pipe(
             prompt=prompt,
@@ -641,7 +636,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         elif mode == "i2v":
             ping = "i2v_generate"
 
-    # ---- debug ----
+    # ---- debug endpoints ----
     if ping in ("echo", "debug"):
         ftfy_ok = True
         try:
@@ -662,6 +657,10 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 "WAN_I2V_PATH": os.environ.get("WAN_I2V_PATH"),
             },
             "resolved_paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
+            "sizes": {
+                "default": {"w": DEFAULT_W, "h": DEFAULT_H},
+                "reels_9_16": {"w": REELS_W, "h": REELS_H},
+            },
         }
 
     if ping == "smoke":
@@ -713,31 +712,36 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             _load_i2v(unload_other=True)
         else:
             _load_t2v(unload_other=True)
-        return {"ok": True, "msg": f"WAN_LOAD_OK:{which}", "elapsed_s": round(time.time() - t0, 3), "gpu_info": _gpu_info()}
+        return {
+            "ok": True,
+            "msg": f"WAN_LOAD_OK:{which}",
+            "elapsed_s": round(time.time() - t0, 3),
+            "gpu_info": _gpu_info()
+        }
 
     # ---- GENERATION ----
     try:
         if ping == "t2v_generate":
-            out = _t2v_generate(inp)
-            return out
+            return _t2v_generate(inp)
 
         if ping == "i2v_generate":
-            out = _i2v_generate(inp)
-            return out
+            return _i2v_generate(inp)
 
         return {"ok": False, "error": f"UNKNOWN_PING: {ping or '<empty>'}", "input_keys": list(inp.keys())}
 
     except Exception as e:
-        # Important: liberar VRAM si algo truena
+        # ✅ Important: liberar VRAM si algo truena
         _hard_cleanup()
+
+        # ✅ DEVOLVER TRACE COMPLETO (clave para debug)
         return {
             "ok": False,
             "error": str(e),
+            "trace": traceback.format_exc(),
             "gpu_info": _gpu_info(),
             **_diffusers_info(),
         }
     finally:
-        # cleanup suave post-job (opcional)
         _cuda_cleanup()
 
 runpod.serverless.start({"handler": handler})
