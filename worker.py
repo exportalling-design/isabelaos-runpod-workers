@@ -216,6 +216,31 @@ def _b64_to_pil_image(image_b64: str):
     img.load()
     return img.convert("RGB")
 
+# ✅ NEW: letterbox/pad para NO deformar
+def _letterbox_to_size(img, target_w: int, target_h: int):
+    from PIL import Image
+    if img is None:
+        return img
+    try:
+        iw, ih = img.size
+        if iw <= 0 or ih <= 0:
+            return img
+
+        # scale para encajar dentro del target
+        scale = min(target_w / float(iw), target_h / float(ih))
+        nw = max(1, int(round(iw * scale)))
+        nh = max(1, int(round(ih * scale)))
+
+        resized = img.resize((nw, nh), Image.LANCZOS)
+
+        canvas = Image.new("RGB", (target_w, target_h), (0, 0, 0))
+        x = (target_w - nw) // 2
+        y = (target_h - nh) // 2
+        canvas.paste(resized, (x, y))
+        return canvas
+    except Exception:
+        return img
+
 # ---------------------------
 # Frames -> MP4 bytes
 # ---------------------------
@@ -335,9 +360,9 @@ def _fix_frames_for_wan(num_frames: int) -> int:
     return num_frames + (4 - r)
 
 # ✅ SOLO 2 tamaños (rápido)
-# ✅ CAMBIO ÚNICO: DEFAULT ahora es horizontal normal
-DEFAULT_W, DEFAULT_H = 1024, 576
-REELS_W, REELS_H = 576, 1024
+# ✅ CAMBIO ÚNICO: default ahora 16:9 real, reels 9:16 real
+DEFAULT_W, DEFAULT_H = 1280, 720
+REELS_W, REELS_H = 720, 1280
 
 def _pick_dims_simple(inp: Dict[str, Any]) -> Tuple[int, int]:
     ar = str(inp.get("aspect_ratio") or "").strip()
@@ -355,7 +380,8 @@ def _normalize_timing(inp: Dict[str, Any]) -> Tuple[int, int, int]:
     seconds = _clamp_int(seconds_raw, 3, 5, 3)
     seconds = 3 if seconds < 4 else 5
 
-    fps = _clamp_int(inp.get("fps", 12), 8, 30, 12)
+    # ✅ CAMBIO: default fps 12 -> 16 (frontend manda 16, esto solo es fallback)
+    fps = _clamp_int(inp.get("fps", 16), 8, 30, 16)
 
     num_frames = seconds * fps
     num_frames = _fix_frames_for_wan(num_frames)
@@ -487,7 +513,8 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
 
     _ensure_signature("t2v", width, height, num_frames)
 
-    steps = _clamp_int(inp.get("steps", 16), 1, 80, 16)
+    # ✅ CAMBIO: default steps 16 -> 18 (solo fallback)
+    steps = _clamp_int(inp.get("steps", 18), 1, 80, 18)
     guidance_scale = float(inp.get("guidance_scale", 5.0) or 5.0)
 
     t0 = time.time()
@@ -551,14 +578,13 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     width = _snap16(width_raw)
     height = _snap16(height_raw)
 
-    try:
-        init_img = init_img.resize((width, height))
-    except Exception:
-        pass
+    # ✅ CAMBIO: NO deformar. Letterbox/pad a (width,height).
+    init_img = _letterbox_to_size(init_img, width, height)
 
     _ensure_signature("i2v", width, height, num_frames)
 
-    steps = _clamp_int(inp.get("steps", 16), 1, 80, 16)
+    # ✅ CAMBIO: default steps 16 -> 18 (solo fallback)
+    steps = _clamp_int(inp.get("steps", 18), 1, 80, 18)
     guidance_scale = float(inp.get("guidance_scale", 5.0) or 5.0)
 
     t0 = time.time()
@@ -634,7 +660,10 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     "WAN_COLD_EACH_JOB": str(WAN_COLD_EACH_JOB),
                 },
                 "resolved_paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
-                "sizes": {"default": {"w": DEFAULT_W, "h": DEFAULT_H}, "reels_9_16": {"w": REELS_W, "h": REELS_H}},
+                "sizes": {
+                    "default": {"w": DEFAULT_W, "h": DEFAULT_H},
+                    "reels_9_16": {"w": REELS_W, "h": REELS_H}
+                },
             }
 
         if ping == "smoke":
@@ -664,7 +693,12 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 **_diffusers_info(),
             }
 
-        return {"ok": False, "error": f"Unknown ping/mode ping='{ping}' mode='{mode}'", "gpu_info": _gpu_info(), **_diffusers_info()}
+        return {
+            "ok": False,
+            "error": f"Unknown ping/mode ping='{ping}' mode='{mode}'",
+            "gpu_info": _gpu_info(),
+            **_diffusers_info()
+        }
 
     except Exception as e:
         # 🔥 trace completo
