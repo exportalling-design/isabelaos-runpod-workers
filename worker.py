@@ -335,8 +335,10 @@ def _fix_frames_for_wan(num_frames: int) -> int:
     return num_frames + (4 - r)
 
 # ✅ SOLO 2 tamaños (rápido)
-# ✅ CAMBIO ÚNICO: DEFAULT ahora es horizontal normal
-DEFAULT_W, DEFAULT_H = 1024, 576
+# ✅ DEFAULT = tamaño “mujer nieve”
+DEFAULT_W, DEFAULT_H = 576, 512
+
+# ✅ Vertical reels 9:16 (si lo usas)
 REELS_W, REELS_H = 576, 1024
 
 def _pick_dims_simple(inp: Dict[str, Any]) -> Tuple[int, int]:
