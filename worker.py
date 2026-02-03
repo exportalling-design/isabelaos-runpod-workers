@@ -1,5 +1,5 @@
 # worker.py (RunPod Serverless) — IsabelaOS Video Worker (WAN)
-# ✅ Worker completo con FIX: expandable_segments OFF + limpieza dura + WAN frames + COLD per job
+# ✅ FIX: anti-OOM load + cleanup BEFORE load + retry load + WAN frames + cold per job
 
 import os
 import time
@@ -14,12 +14,10 @@ from typing import Any, Dict, Optional, Tuple
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# ✅ FIX CRÍTICO: NO usar expandable_segments (dispara INTERNAL ASSERT FAILED en warm)
-# Mantenerlo simple y estable
+# ✅ NO expandable_segments
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256,garbage_collection_threshold:0.8"
 
-# ✅ FIX REAL (serverless): por defecto COLD por job para evitar fragmentación warm
-# Si querés probar warm, ponelo en 0 en env.
+# ✅ serverless: por defecto COLD por job
 WAN_COLD_EACH_JOB = os.environ.get("WAN_COLD_EACH_JOB", "1").strip() not in ("0", "false", "False")
 
 # --- hf cached_download compatibility ---
@@ -34,7 +32,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --- RMSNorm fallback (some builds) ---
+# --- RMSNorm fallback ---
 if not hasattr(nn, "RMSNorm"):
     class RMSNorm(nn.Module):
         def __init__(self, dim, eps=1e-6, elementwise_affine=True):
@@ -87,16 +85,12 @@ MODEL_T2V_LOCAL = _normalize_model_path(os.environ.get("WAN_T2V_PATH", DEFAULT_T
 MODEL_I2V_LOCAL = _normalize_model_path(os.environ.get("WAN_I2V_PATH", DEFAULT_I2V_PATH))
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# ✅ IMPORTANT: Evitar bfloat16 en WAN
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
 _pipe_t2v = None
 _pipe_i2v = None
-
-# firma por pipeline
-_last_sig_t2v: Optional[Tuple[int, int, int]] = None  # (w,h,num_frames)
-_last_sig_i2v: Optional[Tuple[int, int, int]] = None  # (w,h,num_frames)
+_last_sig_t2v: Optional[Tuple[int, int, int]] = None
+_last_sig_i2v: Optional[Tuple[int, int, int]] = None
 
 # ---------------------------
 # Utils
@@ -139,6 +133,8 @@ def _gpu_info():
             info["gpu"] = torch.cuda.get_device_name(0)
             props = torch.cuda.get_device_properties(0)
             info["vram_mb"] = int(props.total_memory / (1024 * 1024))
+            info["mem_alloc_mb"] = int(torch.cuda.memory_allocated(0) / (1024 * 1024))
+            info["mem_reserved_mb"] = int(torch.cuda.memory_reserved(0) / (1024 * 1024))
         except Exception:
             pass
     return info
@@ -152,10 +148,7 @@ def _diffusers_info():
 
 def _assert_model_dir(path: str, label: str):
     if not os.path.isdir(path):
-        raise RuntimeError(
-            f"{label} model path not found: {path}. "
-            "(En serverless casi siempre es /runpod-volume/...)"
-        )
+        raise RuntimeError(f"{label} model path not found: {path}. (serverless suele ser /runpod-volume/...)")
 
 def _pipe_memory_tweaks(pipe):
     try:
@@ -192,18 +185,13 @@ def _lazy_import_wan():
 def _decode_b64(s: str) -> bytes:
     if not s:
         raise ValueError("image_b64 vacío")
-
     s = str(s).strip()
-
     if s.lower().startswith("data:") and "," in s:
         s = s.split(",", 1)[1].strip()
-
     s = s.replace("-", "+").replace("_", "/")
-
     pad = (-len(s)) % 4
     if pad:
         s += "=" * pad
-
     try:
         return base64.b64decode(s, validate=True)
     except (binascii.Error, ValueError) as e:
@@ -221,11 +209,9 @@ def _b64_to_pil_image(image_b64: str):
 # ---------------------------
 def _to_uint8_hwc(frame):
     import numpy as np
-
     if hasattr(frame, "convert"):
         arr = np.array(frame.convert("RGB"), dtype=np.uint8)
         return arr
-
     if torch.is_tensor(frame):
         t = frame.detach().float().cpu()
         arr = t.numpy()
@@ -241,9 +227,6 @@ def _to_uint8_hwc(frame):
         if c_first and not c_last_ok:
             arr = np.transpose(arr, (1, 2, 0))
 
-    if arr.ndim == 3 and arr.shape[-1] not in (1, 2, 3, 4) and arr.shape[0] in (1, 3, 4):
-        arr = np.transpose(arr, (1, 2, 0))
-
     if arr.dtype != np.uint8:
         mx = float(np.max(arr)) if arr.size else 0.0
         if mx <= 1.5:
@@ -257,16 +240,13 @@ def _to_uint8_hwc(frame):
 
 def _normalize_frames(frames):
     import numpy as np
-
     if torch.is_tensor(frames):
         frames = frames.detach().cpu().numpy()
-
     if isinstance(frames, np.ndarray):
         while frames.ndim >= 5 and frames.shape[0] == 1:
             frames = frames[0]
         if frames.ndim == 4:
             return [_to_uint8_hwc(frames[i]) for i in range(frames.shape[0])]
-
     return [_to_uint8_hwc(f) for f in frames]
 
 def _frames_to_mp4_bytes(frames, fps: int = 24) -> bytes:
@@ -274,7 +254,6 @@ def _frames_to_mp4_bytes(frames, fps: int = 24) -> bytes:
     import tempfile
 
     frames_u8 = _normalize_frames(frames)
-
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=True) as tmp:
         writer = imageio.get_writer(tmp.name, fps=fps, codec="libx264", quality=8)
         try:
@@ -282,7 +261,6 @@ def _frames_to_mp4_bytes(frames, fps: int = 24) -> bytes:
                 writer.append_data(arr)
         finally:
             writer.close()
-
         tmp.seek(0)
         return tmp.read()
 
@@ -294,19 +272,16 @@ def _extract_frames(result):
                 if isinstance(v, list) and len(v) == 1 and isinstance(v[0], list):
                     return v[0]
                 return v
-
     for k in ("frames", "videos", "video"):
         if hasattr(result, k):
             v = getattr(result, k)
             if isinstance(v, list) and len(v) == 1 and isinstance(v[0], list):
                 return v[0]
             return v
-
     try:
         return result[0]
     except Exception:
         pass
-
     raise RuntimeError(f"Could not extract frames from result type={type(result)}")
 
 # ---------------------------
@@ -320,11 +295,9 @@ def _clamp_int(v, lo: int, hi: int, default: int) -> int:
     return max(lo, min(hi, n))
 
 def _snap16(n: int) -> int:
-    n = int(n)
-    r = int(round(n / 16.0) * 16)
+    r = int(round(int(n) / 16.0) * 16)
     return max(16, r)
 
-# ✅ WAN exige (num_frames - 1) % 4 == 0
 def _fix_frames_for_wan(num_frames: int) -> int:
     num_frames = int(num_frames)
     if num_frames < 5:
@@ -334,11 +307,7 @@ def _fix_frames_for_wan(num_frames: int) -> int:
         return num_frames
     return num_frames + (4 - r)
 
-# ✅ SOLO 2 tamaños (rápido)
-# ✅ DEFAULT = tamaño “mujer nieve”
 DEFAULT_W, DEFAULT_H = 576, 512
-
-# ✅ Vertical reels 9:16 (si lo usas)
 REELS_W, REELS_H = 576, 1024
 
 def _pick_dims_simple(inp: Dict[str, Any]) -> Tuple[int, int]:
@@ -393,7 +362,7 @@ def _ensure_signature(which: str, width: int, height: int, num_frames: int):
             _last_sig_t2v = sig
             return
         if sig != _last_sig_t2v:
-            print(f"[SIG] T2V changed {_last_sig_t2v} -> {sig} | forcing full unload")
+            print(f"[SIG] T2V changed {_last_sig_t2v} -> {sig} | forcing unload")
             _unload_pipes()
             _last_sig_t2v = sig
             return
@@ -403,12 +372,12 @@ def _ensure_signature(which: str, width: int, height: int, num_frames: int):
             _last_sig_i2v = sig
             return
         if sig != _last_sig_i2v:
-            print(f"[SIG] I2V changed {_last_sig_i2v} -> {sig} | forcing full unload")
+            print(f"[SIG] I2V changed {_last_sig_i2v} -> {sig} | forcing unload")
             _unload_pipes()
             _last_sig_i2v = sig
             return
 
-def _load_t2v():
+def _load_t2v_once():
     global _pipe_t2v
     if _pipe_t2v is not None:
         return _pipe_t2v
@@ -420,6 +389,10 @@ def _load_t2v():
 
     t0 = time.time()
     print(f"[WAN_LOAD] T2V from: {MODEL_T2V_LOCAL} dtype={DTYPE} device={DEVICE}")
+    print("[WAN_LOAD] gpu before load:", _gpu_info())
+
+    # ✅ IMPORTANT: limpiar antes de cargar (evita OOM por residuos de warm container)
+    _hard_cleanup()
 
     vae = AutoencoderKLWan.from_pretrained(
         MODEL_T2V_LOCAL, subfolder="vae",
@@ -434,13 +407,28 @@ def _load_t2v():
         local_files_only=True,
         low_cpu_mem_usage=True,
     )
+
+    # ✅ mover a cuda solo al final
     if DEVICE == "cuda":
+        pipe = _pipe_memory_tweaks(pipe)
         pipe = pipe.to("cuda")
+
     _pipe_t2v = _pipe_memory_tweaks(pipe)
     print(f"[WAN_LOAD] T2V loaded in {time.time()-t0:.2f}s")
+    print("[WAN_LOAD] gpu after load:", _gpu_info())
     return _pipe_t2v
 
-def _load_i2v():
+def _load_t2v():
+    # ✅ retry inteligente si OOM en .to("cuda")
+    try:
+        return _load_t2v_once()
+    except torch.cuda.OutOfMemoryError as e:
+        print("[WAN_LOAD] OOM on load. Forcing unload + cleanup + retry once.")
+        _unload_pipes()
+        _hard_cleanup()
+        return _load_t2v_once()
+
+def _load_i2v_once():
     global _pipe_i2v
     if _pipe_i2v is not None:
         return _pipe_i2v
@@ -452,6 +440,9 @@ def _load_i2v():
 
     t0 = time.time()
     print(f"[WAN_LOAD] I2V from: {MODEL_I2V_LOCAL} dtype={DTYPE} device={DEVICE}")
+    print("[WAN_LOAD] gpu before load:", _gpu_info())
+
+    _hard_cleanup()
 
     vae = AutoencoderKLWan.from_pretrained(
         MODEL_I2V_LOCAL, subfolder="vae",
@@ -466,11 +457,24 @@ def _load_i2v():
         local_files_only=True,
         low_cpu_mem_usage=True,
     )
+
     if DEVICE == "cuda":
+        pipe = _pipe_memory_tweaks(pipe)
         pipe = pipe.to("cuda")
+
     _pipe_i2v = _pipe_memory_tweaks(pipe)
     print(f"[WAN_LOAD] I2V loaded in {time.time()-t0:.2f}s")
+    print("[WAN_LOAD] gpu after load:", _gpu_info())
     return _pipe_i2v
+
+def _load_i2v():
+    try:
+        return _load_i2v_once()
+    except torch.cuda.OutOfMemoryError:
+        print("[WAN_LOAD] OOM on load. Forcing unload + cleanup + retry once.")
+        _unload_pipes()
+        _hard_cleanup()
+        return _load_i2v_once()
 
 # ---------------------------
 # Generators
@@ -494,6 +498,7 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
 
     t0 = time.time()
     print(f"[T2V] w={width} h={height} frames={num_frames} fps={fps} steps={steps}")
+    print("[T2V] gpu pre:", _gpu_info())
 
     result = None
     frames = None
@@ -535,11 +540,9 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     finally:
-        # ✅ limpieza SIEMPRE, incluso si truena
         if WAN_COLD_EACH_JOB:
             _unload_pipes()
         else:
-            # ✅ FIX WARM: liberar tensores grandes antes del empty_cache
             try:
                 del result, frames, mp4_bytes, mp4_b64
             except Exception:
@@ -579,6 +582,7 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
 
     t0 = time.time()
     print(f"[I2V] w={width} h={height} frames={num_frames} fps={fps} steps={steps}")
+    print("[I2V] gpu pre:", _gpu_info())
 
     result = None
     frames = None
@@ -624,7 +628,6 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
         if WAN_COLD_EACH_JOB:
             _unload_pipes()
         else:
-            # ✅ FIX WARM: liberar tensores grandes antes del empty_cache
             try:
                 del result, frames, mp4_bytes, mp4_b64, init_img
             except Exception:
@@ -636,13 +639,21 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
             _cuda_cleanup()
 
 # ---------------------------
-# Handler
+# Handler (ANTI-OOM desde el inicio)
 # ---------------------------
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
         inp = job.get("input") or {}
         ping = str(inp.get("ping") or "").strip().lower()
         mode = str(inp.get("mode") or "").strip().lower()
+
+        # ✅ CRÍTICO: limpiar SIEMPRE antes de cargar/generar (serverless warm containers)
+        if ping not in ("echo", "debug", "smoke", "list_paths"):
+            # si estamos en cold mode, descargamos todo de una
+            if WAN_COLD_EACH_JOB:
+                _unload_pipes()
+            else:
+                _hard_cleanup()
 
         if not ping and mode:
             if mode == "t2v":
@@ -697,7 +708,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": f"Unknown ping/mode ping='{ping}' mode='{mode}'", "gpu_info": _gpu_info(), **_diffusers_info()}
 
     except Exception as e:
-        # 🔥 trace completo
         return {
             "ok": False,
             "error": str(e),
