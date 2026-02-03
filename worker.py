@@ -1,5 +1,5 @@
 # worker.py (RunPod Serverless) — IsabelaOS Video Worker (WAN)
-# ✅ FIX: anti-OOM load + cleanup BEFORE load + retry load + WAN frames + cold per job
+# ✅ FIX: dtype correcto al mover a GPU + VAE fp16 + sin double-load + fallback offload
 
 import os
 import time
@@ -10,17 +10,23 @@ import traceback
 from io import BytesIO
 from typing import Any, Dict, Optional, Tuple
 
-# --- ENV hardening ---
+# ---------------------------
+# ENV hardening
+# ---------------------------
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ✅ NO expandable_segments
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256,garbage_collection_threshold:0.8"
 
-# ✅ serverless: por defecto COLD por job
 WAN_COLD_EACH_JOB = os.environ.get("WAN_COLD_EACH_JOB", "1").strip() not in ("0", "false", "False")
 
-# --- hf cached_download compatibility ---
+# Si querés forzar fallback (por pruebas):
+WAN_ALLOW_CPU_OFFLOAD_FALLBACK = os.environ.get("WAN_ALLOW_CPU_OFFLOAD_FALLBACK", "1").strip() not in ("0","false","False")
+
+# ---------------------------
+# huggingface_hub compat
+# ---------------------------
 import huggingface_hub as h
 if not hasattr(h, "cached_download"):
     from huggingface_hub import hf_hub_download as _hf_hub_download
@@ -32,7 +38,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --- RMSNorm fallback ---
+# RMSNorm fallback
 if not hasattr(nn, "RMSNorm"):
     class RMSNorm(nn.Module):
         def __init__(self, dim, eps=1e-6, elementwise_affine=True):
@@ -50,10 +56,9 @@ if not hasattr(nn, "RMSNorm"):
             if getattr(self, "weight", None) is not None:
                 x_norm = x_norm * self.weight
             return x_norm
-
     nn.RMSNorm = RMSNorm
 
-# --- Some torch builds don't like enable_gqa kwarg ---
+# Some torch builds don't like enable_gqa kwarg
 if hasattr(F, "scaled_dot_product_attention"):
     _orig_sdp = F.scaled_dot_product_attention
     def patched_sdp_attention(*args, **kwargs):
@@ -78,7 +83,7 @@ def _normalize_model_path(p: str) -> str:
         p = p.replace("//", "/")
     return p
 
-DEFAULT_T2V_PATH = "/runpod-volume/models/wan22/ti2v-5b"
+DEFAULT_T2V_PATH = "/runpod-volume/models/wan22/t2v-5b"
 DEFAULT_I2V_PATH = "/runpod-volume/models/wan22/i2v-a14b"
 
 MODEL_T2V_LOCAL = _normalize_model_path(os.environ.get("WAN_T2V_PATH", DEFAULT_T2V_PATH))
@@ -89,6 +94,7 @@ DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
 _pipe_t2v = None
 _pipe_i2v = None
+
 _last_sig_t2v: Optional[Tuple[int, int, int]] = None
 _last_sig_i2v: Optional[Tuple[int, int, int]] = None
 
@@ -101,18 +107,11 @@ def _cuda_cleanup():
             torch.cuda.synchronize()
         except Exception:
             pass
-        try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
-        try:
-            torch.cuda.ipc_collect()
-        except Exception:
-            pass
-        try:
-            torch.cuda.reset_peak_memory_stats()
-        except Exception:
-            pass
+        for fn in ("empty_cache", "ipc_collect", "reset_peak_memory_stats"):
+            try:
+                getattr(torch.cuda, fn)()
+            except Exception:
+                pass
 
 def _hard_cleanup():
     try:
@@ -133,8 +132,8 @@ def _gpu_info():
             info["gpu"] = torch.cuda.get_device_name(0)
             props = torch.cuda.get_device_properties(0)
             info["vram_mb"] = int(props.total_memory / (1024 * 1024))
-            info["mem_alloc_mb"] = int(torch.cuda.memory_allocated(0) / (1024 * 1024))
-            info["mem_reserved_mb"] = int(torch.cuda.memory_reserved(0) / (1024 * 1024))
+            info["mem_alloc_mb"] = int(torch.cuda.memory_allocated() / (1024 * 1024))
+            info["mem_reserved_mb"] = int(torch.cuda.memory_reserved() / (1024 * 1024))
         except Exception:
             pass
     return info
@@ -148,7 +147,7 @@ def _diffusers_info():
 
 def _assert_model_dir(path: str, label: str):
     if not os.path.isdir(path):
-        raise RuntimeError(f"{label} model path not found: {path}. (serverless suele ser /runpod-volume/...)")
+        raise RuntimeError(f"{label} model path not found: {path} (serverless normalmente /runpod-volume/...)")
 
 def _pipe_memory_tweaks(pipe):
     try:
@@ -181,7 +180,9 @@ def _lazy_import_wan():
     except Exception as e:
         return None, None, None, str(e)
 
-# ---------- Robust base64 image decode ----------
+# ---------------------------
+# base64 image decode
+# ---------------------------
 def _decode_b64(s: str) -> bytes:
     if not s:
         raise ValueError("image_b64 vacío")
@@ -210,11 +211,10 @@ def _b64_to_pil_image(image_b64: str):
 def _to_uint8_hwc(frame):
     import numpy as np
     if hasattr(frame, "convert"):
-        arr = np.array(frame.convert("RGB"), dtype=np.uint8)
-        return arr
+        return np.array(frame.convert("RGB"), dtype=np.uint8)
+
     if torch.is_tensor(frame):
-        t = frame.detach().float().cpu()
-        arr = t.numpy()
+        arr = frame.detach().float().cpu().numpy()
     else:
         arr = np.asarray(frame)
 
@@ -252,7 +252,6 @@ def _normalize_frames(frames):
 def _frames_to_mp4_bytes(frames, fps: int = 24) -> bytes:
     import imageio.v2 as imageio
     import tempfile
-
     frames_u8 = _normalize_frames(frames)
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=True) as tmp:
         writer = imageio.get_writer(tmp.name, fps=fps, codec="libx264", quality=8)
@@ -326,7 +325,7 @@ def _normalize_timing(inp: Dict[str, Any]) -> Tuple[int, int, int]:
     seconds = _clamp_int(seconds_raw, 3, 5, 3)
     seconds = 3 if seconds < 4 else 5
 
-    fps = _clamp_int(inp.get("fps", 12), 8, 30, 12)
+    fps = _clamp_int(inp.get("fps", 16), 8, 30, 16)
 
     num_frames = seconds * fps
     num_frames = _fix_frames_for_wan(num_frames)
@@ -337,16 +336,16 @@ def _normalize_timing(inp: Dict[str, Any]) -> Tuple[int, int, int]:
 # ---------------------------
 def _unload_pipes():
     global _pipe_t2v, _pipe_i2v, _last_sig_t2v, _last_sig_i2v
-    if _pipe_t2v is not None:
-        try:
+    try:
+        if _pipe_t2v is not None:
             del _pipe_t2v
-        except Exception:
-            pass
-    if _pipe_i2v is not None:
-        try:
+    except Exception:
+        pass
+    try:
+        if _pipe_i2v is not None:
             del _pipe_i2v
-        except Exception:
-            pass
+    except Exception:
+        pass
     _pipe_t2v = None
     _pipe_i2v = None
     _last_sig_t2v = None
@@ -356,7 +355,6 @@ def _unload_pipes():
 def _ensure_signature(which: str, width: int, height: int, num_frames: int):
     global _last_sig_t2v, _last_sig_i2v
     sig = (int(width), int(height), int(num_frames))
-
     if which == "t2v":
         if _last_sig_t2v is None:
             _last_sig_t2v = sig
@@ -366,7 +364,6 @@ def _ensure_signature(which: str, width: int, height: int, num_frames: int):
             _unload_pipes()
             _last_sig_t2v = sig
             return
-
     if which == "i2v":
         if _last_sig_i2v is None:
             _last_sig_i2v = sig
@@ -377,7 +374,24 @@ def _ensure_signature(which: str, width: int, height: int, num_frames: int):
             _last_sig_i2v = sig
             return
 
-def _load_t2v_once():
+def _move_pipe_to_cuda_safe(pipe):
+    # ✅ CLAVE: pasar dtype explícito para que NO intente mover partes en fp32
+    pipe = pipe.to("cuda", dtype=DTYPE)
+    return pipe
+
+def _try_enable_cpu_offload(pipe):
+    if not WAN_ALLOW_CPU_OFFLOAD_FALLBACK:
+        return pipe
+    try:
+        # requiere accelerate instalado
+        pipe.enable_model_cpu_offload()
+        print("[WAN] CPU offload ENABLED (fallbackússia fallback por OOM)")
+        return pipe
+    except Exception as e:
+        print("[WAN] CPU offload not available:", e)
+        return pipe
+
+def _load_t2v():
     global _pipe_t2v
     if _pipe_t2v is not None:
         return _pipe_t2v
@@ -389,17 +403,16 @@ def _load_t2v_once():
 
     t0 = time.time()
     print(f"[WAN_LOAD] T2V from: {MODEL_T2V_LOCAL} dtype={DTYPE} device={DEVICE}")
-    print("[WAN_LOAD] gpu before load:", _gpu_info())
 
-    # ✅ IMPORTANT: limpiar antes de cargar (evita OOM por residuos de warm container)
-    _hard_cleanup()
-
+    # ✅ VAE en fp16 (antes lo tenías fp32)
     vae = AutoencoderKLWan.from_pretrained(
-        MODEL_T2V_LOCAL, subfolder="vae",
-        torch_dtype=torch.float32,
+        MODEL_T2V_LOCAL,
+        subfolder="vae",
+        torch_dtype=DTYPE,
         local_files_only=True,
         low_cpu_mem_usage=True,
     )
+
     pipe = WanPipeline.from_pretrained(
         MODEL_T2V_LOCAL,
         vae=vae,
@@ -408,27 +421,19 @@ def _load_t2v_once():
         low_cpu_mem_usage=True,
     )
 
-    # ✅ mover a cuda solo al final
     if DEVICE == "cuda":
-        pipe = _pipe_memory_tweaks(pipe)
-        pipe = pipe.to("cuda")
+        try:
+            pipe = _move_pipe_to_cuda_safe(pipe)
+        except torch.cuda.OutOfMemoryError as oom:
+            print("[WAN_LOAD] OOM moving T2V to cuda, trying cleanup + offload fallback:", oom)
+            _hard_cleanup()
+            pipe = _try_enable_cpu_offload(pipe)
 
     _pipe_t2v = _pipe_memory_tweaks(pipe)
     print(f"[WAN_LOAD] T2V loaded in {time.time()-t0:.2f}s")
-    print("[WAN_LOAD] gpu after load:", _gpu_info())
     return _pipe_t2v
 
-def _load_t2v():
-    # ✅ retry inteligente si OOM en .to("cuda")
-    try:
-        return _load_t2v_once()
-    except torch.cuda.OutOfMemoryError as e:
-        print("[WAN_LOAD] OOM on load. Forcing unload + cleanup + retry once.")
-        _unload_pipes()
-        _hard_cleanup()
-        return _load_t2v_once()
-
-def _load_i2v_once():
+def _load_i2v():
     global _pipe_i2v
     if _pipe_i2v is not None:
         return _pipe_i2v
@@ -440,16 +445,15 @@ def _load_i2v_once():
 
     t0 = time.time()
     print(f"[WAN_LOAD] I2V from: {MODEL_I2V_LOCAL} dtype={DTYPE} device={DEVICE}")
-    print("[WAN_LOAD] gpu before load:", _gpu_info())
-
-    _hard_cleanup()
 
     vae = AutoencoderKLWan.from_pretrained(
-        MODEL_I2V_LOCAL, subfolder="vae",
-        torch_dtype=torch.float32,
+        MODEL_I2V_LOCAL,
+        subfolder="vae",
+        torch_dtype=DTYPE,
         local_files_only=True,
         low_cpu_mem_usage=True,
     )
+
     pipe = WanImageToVideoPipeline.from_pretrained(
         MODEL_I2V_LOCAL,
         vae=vae,
@@ -459,22 +463,16 @@ def _load_i2v_once():
     )
 
     if DEVICE == "cuda":
-        pipe = _pipe_memory_tweaks(pipe)
-        pipe = pipe.to("cuda")
+        try:
+            pipe = _move_pipe_to_cuda_safe(pipe)
+        except torch.cuda.OutOfMemoryError as oom:
+            print("[WAN_LOAD] OOM moving I2V to cuda, trying cleanup + offload fallback:", oom)
+            _hard_cleanup()
+            pipe = _try_enable_cpu_offload(pipe)
 
     _pipe_i2v = _pipe_memory_tweaks(pipe)
     print(f"[WAN_LOAD] I2V loaded in {time.time()-t0:.2f}s")
-    print("[WAN_LOAD] gpu after load:", _gpu_info())
     return _pipe_i2v
-
-def _load_i2v():
-    try:
-        return _load_i2v_once()
-    except torch.cuda.OutOfMemoryError:
-        print("[WAN_LOAD] OOM on load. Forcing unload + cleanup + retry once.")
-        _unload_pipes()
-        _hard_cleanup()
-        return _load_i2v_once()
 
 # ---------------------------
 # Generators
@@ -493,17 +491,15 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
 
     _ensure_signature("t2v", width, height, num_frames)
 
-    steps = _clamp_int(inp.get("steps", 16), 1, 80, 16)
+    steps = _clamp_int(inp.get("steps", 18), 1, 80, 18)
     guidance_scale = float(inp.get("guidance_scale", 5.0) or 5.0)
 
     t0 = time.time()
     print(f"[T2V] w={width} h={height} frames={num_frames} fps={fps} steps={steps}")
-    print("[T2V] gpu pre:", _gpu_info())
 
     result = None
     frames = None
     mp4_bytes = None
-    mp4_b64 = None
 
     try:
         pipe = _load_t2v()
@@ -520,7 +516,6 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
 
         frames = _extract_frames(result)
         mp4_bytes = _frames_to_mp4_bytes(frames, fps=fps)
-        mp4_b64 = base64.b64encode(mp4_bytes).decode("utf-8")
 
         return {
             "ok": True,
@@ -533,7 +528,7 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
             "steps": steps,
             "guidance_scale": guidance_scale,
             "elapsed_s": round(time.time() - t0, 3),
-            "video_b64": mp4_b64,
+            "video_b64": base64.b64encode(mp4_bytes).decode("utf-8"),
             "video_mime": "video/mp4",
             "gpu_info": _gpu_info(),
             **_diffusers_info(),
@@ -544,14 +539,10 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
             _unload_pipes()
         else:
             try:
-                del result, frames, mp4_bytes, mp4_b64
+                del result, frames, mp4_bytes
             except Exception:
                 pass
-            try:
-                gc.collect()
-            except Exception:
-                pass
-            _cuda_cleanup()
+            _hard_cleanup()
 
 def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     prompt = str(inp.get("prompt") or "").strip()
@@ -577,17 +568,15 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
 
     _ensure_signature("i2v", width, height, num_frames)
 
-    steps = _clamp_int(inp.get("steps", 16), 1, 80, 16)
+    steps = _clamp_int(inp.get("steps", 18), 1, 80, 18)
     guidance_scale = float(inp.get("guidance_scale", 5.0) or 5.0)
 
     t0 = time.time()
     print(f"[I2V] w={width} h={height} frames={num_frames} fps={fps} steps={steps}")
-    print("[I2V] gpu pre:", _gpu_info())
 
     result = None
     frames = None
     mp4_bytes = None
-    mp4_b64 = None
 
     try:
         pipe = _load_i2v()
@@ -605,7 +594,6 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
 
         frames = _extract_frames(result)
         mp4_bytes = _frames_to_mp4_bytes(frames, fps=fps)
-        mp4_b64 = base64.b64encode(mp4_bytes).decode("utf-8")
 
         return {
             "ok": True,
@@ -618,7 +606,7 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
             "steps": steps,
             "guidance_scale": guidance_scale,
             "elapsed_s": round(time.time() - t0, 3),
-            "video_b64": mp4_b64,
+            "video_b64": base64.b64encode(mp4_bytes).decode("utf-8"),
             "video_mime": "video/mp4",
             "gpu_info": _gpu_info(),
             **_diffusers_info(),
@@ -629,17 +617,13 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
             _unload_pipes()
         else:
             try:
-                del result, frames, mp4_bytes, mp4_b64, init_img
+                del result, frames, mp4_bytes, init_img
             except Exception:
                 pass
-            try:
-                gc.collect()
-            except Exception:
-                pass
-            _cuda_cleanup()
+            _hard_cleanup()
 
 # ---------------------------
-# Handler (ANTI-OOM desde el inicio)
+# Handler
 # ---------------------------
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
@@ -647,19 +631,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         ping = str(inp.get("ping") or "").strip().lower()
         mode = str(inp.get("mode") or "").strip().lower()
 
-        # ✅ CRÍTICO: limpiar SIEMPRE antes de cargar/generar (serverless warm containers)
-        if ping not in ("echo", "debug", "smoke", "list_paths"):
-            # si estamos en cold mode, descargamos todo de una
-            if WAN_COLD_EACH_JOB:
-                _unload_pipes()
-            else:
-                _hard_cleanup()
-
         if not ping and mode:
-            if mode == "t2v":
-                ping = "t2v_generate"
-            elif mode == "i2v":
-                ping = "i2v_generate"
+            ping = "t2v_generate" if mode == "t2v" else "i2v_generate" if mode == "i2v" else ""
 
         if ping in ("echo", "debug"):
             return {
@@ -673,19 +646,11 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     "WAN_I2V_PATH": os.environ.get("WAN_I2V_PATH"),
                     "PYTORCH_CUDA_ALLOC_CONF": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
                     "WAN_COLD_EACH_JOB": str(WAN_COLD_EACH_JOB),
+                    "WAN_ALLOW_CPU_OFFLOAD_FALLBACK": str(WAN_ALLOW_CPU_OFFLOAD_FALLBACK),
                 },
                 "resolved_paths": {"t2v": MODEL_T2V_LOCAL, "i2v": MODEL_I2V_LOCAL},
                 "sizes": {"default": {"w": DEFAULT_W, "h": DEFAULT_H}, "reels_9_16": {"w": REELS_W, "h": REELS_H}},
             }
-
-        if ping == "smoke":
-            return {"ok": True, "msg": "SMOKE_OK", "gpu_info": _gpu_info(), **_diffusers_info()}
-
-        if ping in ("t2v_generate", "t2v"):
-            return _t2v_generate(inp)
-
-        if ping in ("i2v_generate", "i2v"):
-            return _i2v_generate(inp)
 
         if ping == "list_paths":
             candidates = [
@@ -704,6 +669,12 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 "gpu_info": _gpu_info(),
                 **_diffusers_info(),
             }
+
+        if ping in ("t2v_generate", "t2v"):
+            return _t2v_generate(inp)
+
+        if ping in ("i2v_generate", "i2v"):
+            return _i2v_generate(inp)
 
         return {"ok": False, "error": f"Unknown ping/mode ping='{ping}' mode='{mode}'", "gpu_info": _gpu_info(), **_diffusers_info()}
 
