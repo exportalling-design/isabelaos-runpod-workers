@@ -24,7 +24,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256,garbage_collectio
 WAN_COLD_EACH_JOB = os.environ.get("WAN_COLD_EACH_JOB", "1").strip() not in ("0", "false", "False")
 
 # Si querés forzar fallback (por pruebas):
-WAN_ALLOW_CPU_OFFLOAD_FALLBACK = os.environ.get("WAN_ALLOW_CPU_OFFLOAD_FALLBACK", "1").strip() not in ("0","false","False")
+WAN_ALLOW_CPU_OFFLOAD_FALLBACK = os.environ.get("WAN_ALLOW_CPU_OFFLOAD_FALLBACK", "1").strip() not in ("0", "false", "False")
 
 # ---------------------------
 # huggingface_hub compat
@@ -438,7 +438,7 @@ def _try_enable_cpu_offload(pipe):
     try:
         # requiere accelerate instalado
         pipe.enable_model_cpu_offload()
-        print("[WAN] CPU offload ENABLED (fallbackússia fallback por OOM)")
+        print("[WAN] CPU offload ENABLED (fallback por OOM)")
         return pipe
     except Exception as e:
         print("[WAN] CPU offload not available:", e)
@@ -457,7 +457,7 @@ def _load_t2v():
     t0 = time.time()
     print(f"[WAN_LOAD] T2V from: {MODEL_T2V_LOCAL} dtype={DTYPE} device={DEVICE}")
 
-    # ✅ VAE en fp16 (antes lo tenías fp32)
+    # ✅ VAE en fp16
     vae = AutoencoderKLWan.from_pretrained(
         MODEL_T2V_LOCAL,
         subfolder="vae",
@@ -621,6 +621,7 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     width = _snap16(width_raw)
     height = _snap16(height_raw)
 
+    # ✅ Lanczos resize (mejor bordes/pelo)
     try:
         from PIL import Image
         init_img = init_img.resize((width, height), resample=Image.LANCZOS)
