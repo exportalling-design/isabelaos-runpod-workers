@@ -1,5 +1,7 @@
 # worker.py (RunPod Serverless) — IsabelaOS Video Worker (WAN)
 # ✅ FIX: dtype correcto al mover a GPU + VAE fp16 + sin double-load + fallback offload
+# ✅ UPDATE: respeta width/height si vienen del backend + seed estable + i2v denoise/motion_strength safe
+# ✅ UPDATE: _call_pipe_safely filtra kwargs soportados por el pipeline (evita romper por versiones)
 
 import os
 import time
@@ -37,6 +39,9 @@ if not hasattr(h, "cached_download"):
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# ✅ NEW: call filtering + seed helpers
+import inspect
 
 # RMSNorm fallback
 if not hasattr(nn, "RMSNorm"):
@@ -181,6 +186,46 @@ def _lazy_import_wan():
         return None, None, None, str(e)
 
 # ---------------------------
+# NEW: call filtering + seed helpers
+# ---------------------------
+def _clamp_float(v, lo: float, hi: float, default: float) -> float:
+    try:
+        x = float(v)
+    except Exception:
+        return default
+    return max(lo, min(hi, x))
+
+def _get_seed(inp: Dict[str, Any]) -> int:
+    for k in ("seed", "random_seed"):
+        if k in inp and inp[k] is not None:
+            try:
+                return int(float(inp[k]))
+            except Exception:
+                pass
+    return 12345
+
+def _make_generator(seed: int):
+    if DEVICE != "cuda":
+        return None
+    g = torch.Generator(device="cuda")
+    g.manual_seed(int(seed))
+    return g
+
+def _call_pipe_safely(pipe, **kwargs):
+    """
+    Llama al pipeline SOLO con args soportados por su __call__.
+    Evita errores por kwargs desconocidos.
+    """
+    try:
+        sig = inspect.signature(pipe.__call__)
+        allowed = set(sig.parameters.keys())
+        filtered = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
+        return pipe(**filtered)
+    except Exception:
+        # fallback: si signature falla, intenta igual (como antes)
+        return pipe(**{k: v for k, v in kwargs.items() if v is not None})
+
+# ---------------------------
 # base64 image decode
 # ---------------------------
 def _decode_b64(s: str) -> bytes:
@@ -310,6 +355,14 @@ DEFAULT_W, DEFAULT_H = 576, 512
 REELS_W, REELS_H = 576, 1024
 
 def _pick_dims_simple(inp: Dict[str, Any]) -> Tuple[int, int]:
+    # ✅ UPDATE: respeta width/height del backend si vienen
+    w_in = inp.get("width", None)
+    h_in = inp.get("height", None)
+    if w_in is not None and h_in is not None and str(w_in).strip() != "" and str(h_in).strip() != "":
+        w = _snap16(_clamp_int(w_in, 256, 1536, DEFAULT_W))
+        h = _snap16(_clamp_int(h_in, 256, 1536, DEFAULT_H))
+        return w, h
+
     ar = str(inp.get("aspect_ratio") or "").strip()
     if ar == "9:16":
         return REELS_W, REELS_H
@@ -492,10 +545,14 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     _ensure_signature("t2v", width, height, num_frames)
 
     steps = _clamp_int(inp.get("steps", 18), 1, 80, 18)
-    guidance_scale = float(inp.get("guidance_scale", 5.0) or 5.0)
+
+    # ✅ UPDATE: clamp + seed estable
+    guidance_scale = _clamp_float(inp.get("guidance_scale", 5.0), 1.0, 10.0, 5.0)
+    seed = _get_seed(inp)
+    generator = _make_generator(seed)
 
     t0 = time.time()
-    print(f"[T2V] w={width} h={height} frames={num_frames} fps={fps} steps={steps}")
+    print(f"[T2V] w={width} h={height} frames={num_frames} fps={fps} steps={steps} cfg={guidance_scale} seed={seed}")
 
     result = None
     frames = None
@@ -504,7 +561,8 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     try:
         pipe = _load_t2v()
         with torch.inference_mode():
-            result = pipe(
+            result = _call_pipe_safely(
+                pipe,
                 prompt=prompt,
                 negative_prompt=negative if negative else None,
                 width=width,
@@ -512,6 +570,7 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
                 num_frames=num_frames,
                 num_inference_steps=steps,
                 guidance_scale=guidance_scale,
+                generator=generator,
             )
 
         frames = _extract_frames(result)
@@ -527,6 +586,7 @@ def _t2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
             "num_frames": num_frames,
             "steps": steps,
             "guidance_scale": guidance_scale,
+            "seed": seed,
             "elapsed_s": round(time.time() - t0, 3),
             "video_b64": base64.b64encode(mp4_bytes).decode("utf-8"),
             "video_mime": "video/mp4",
@@ -562,17 +622,27 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     height = _snap16(height_raw)
 
     try:
-        init_img = init_img.resize((width, height))
+        from PIL import Image
+        init_img = init_img.resize((width, height), resample=Image.LANCZOS)
     except Exception:
-        pass
+        try:
+            init_img = init_img.resize((width, height))
+        except Exception:
+            pass
 
     _ensure_signature("i2v", width, height, num_frames)
 
     steps = _clamp_int(inp.get("steps", 18), 1, 80, 18)
-    guidance_scale = float(inp.get("guidance_scale", 5.0) or 5.0)
+
+    # ✅ UPDATE: clamp cfg + denoise/strength + motion_strength + seed generator
+    guidance_scale = _clamp_float(inp.get("guidance_scale", 5.0), 1.0, 10.0, 5.0)
+    denoise = _clamp_float(inp.get("denoise", inp.get("strength", 0.45)), 0.20, 0.80, 0.45)
+    motion_strength = _clamp_float(inp.get("motion_strength", 0.6), 0.10, 1.00, 0.60)
+    seed = _get_seed(inp)
+    generator = _make_generator(seed)
 
     t0 = time.time()
-    print(f"[I2V] w={width} h={height} frames={num_frames} fps={fps} steps={steps}")
+    print(f"[I2V] w={width} h={height} frames={num_frames} fps={fps} steps={steps} cfg={guidance_scale} denoise={denoise} motion={motion_strength} seed={seed}")
 
     result = None
     frames = None
@@ -581,7 +651,8 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
     try:
         pipe = _load_i2v()
         with torch.inference_mode():
-            result = pipe(
+            result = _call_pipe_safely(
+                pipe,
                 prompt=prompt,
                 image=init_img,
                 negative_prompt=negative if negative else None,
@@ -590,6 +661,16 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
                 num_frames=num_frames,
                 num_inference_steps=steps,
                 guidance_scale=guidance_scale,
+
+                # ✅ estabilidad
+                generator=generator,
+
+                # ✅ “cuánto se aleja de la imagen base”
+                strength=denoise,
+                denoise=denoise,
+
+                # ✅ movimiento (si existe)
+                motion_strength=motion_strength,
             )
 
         frames = _extract_frames(result)
@@ -605,6 +686,9 @@ def _i2v_generate(inp: Dict[str, Any]) -> Dict[str, Any]:
             "num_frames": num_frames,
             "steps": steps,
             "guidance_scale": guidance_scale,
+            "seed": seed,
+            "denoise": denoise,
+            "motion_strength": motion_strength,
             "elapsed_s": round(time.time() - t0, 3),
             "video_b64": base64.b64encode(mp4_bytes).decode("utf-8"),
             "video_mime": "video/mp4",
